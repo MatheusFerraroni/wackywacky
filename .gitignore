@@ -219,3 +219,9 @@ __marimo__/
 # CUSTOM
 *.DS_Store
 clean_folders.sh
+prometheus_data/
+otel_data/
+mysql_data/
+jaeger_data/
+grafana_data/
+loki/data/

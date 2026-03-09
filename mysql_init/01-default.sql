@@ -41,9 +41,9 @@ CREATE TABLE `pages` (
     'processing',
     'done',
     'failed',
-    'connection_error',
     'blocked_domain',
-    'blocked_limit_recursion'
+    'blocked_limit_recursion',
+    'blocked_language'
   ) NOT NULL DEFAULT 'todo',
 
   `retry_count` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
@@ -124,8 +124,8 @@ COLLATE=utf8mb4_0900_ai_ci;
 INSERT INTO `settings` (`key`, `value`, `description`) VALUES
   (
     'request_timeout_ms',
-    JSON_EXTRACT('5000', '$'),
-    'HTTP request timeout in milliseconds'
+    JSON_EXTRACT('10000', '$'),
+    'Timeout in milliseconds to page load; select body/2; networkidle/3;'
   ),
   (
     'max_retry_attempts',

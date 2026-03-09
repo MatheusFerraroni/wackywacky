@@ -16,6 +16,8 @@ processors:
 
 exporters:
   debug:
+    verbosity: basic
+
   otlp/jaeger:
     endpoint: jaeger:4317
     tls:
@@ -27,10 +29,34 @@ exporters:
     retry_on_failure:
       enabled: true
 
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    encoding: proto
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+
+  prometheus:
+    endpoint: "0.0.0.0:9464"
+
 service:
   extensions: [file_storage]
+
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
       exporters: [debug, otlp/jaeger]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlphttp/loki]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, prometheus]

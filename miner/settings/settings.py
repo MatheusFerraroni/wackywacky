@@ -11,6 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 env_path = BASE_DIR / '.env'
 
+
 if env_path.exists():
     load_dotenv(env_path)
     logger.info('Loaded environment variables from %s', env_path)
@@ -31,6 +32,11 @@ class Settings:
     OTEL_SERVICE_NAME = os.getenv('OTEL_SERVICE_NAME', 'miner')
     OTEL_SERVICE_VERSION = os.getenv('OTEL_SERVICE_VERSION', '1.0.0')
     OTEL_ENV = os.getenv('OTEL_ENV', 'dev')
-    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = os.getenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', 'http://localhost:4318/v1/traces')
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = os.getenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', 'http://localhost:4318')
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = os.getenv('OTEL_EXPORTER_OTLP_LOGS_ENDPOINT', 'http://localhost:4318')
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = os.getenv('OTEL_EXPORTER_OTLP_METRICS_ENDPOINT', 'http://localhost:4318')
+
+    LANGUAGE_TARGETS = set(['pt'])
+
 
 settings = Settings()

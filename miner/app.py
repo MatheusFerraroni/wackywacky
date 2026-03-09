@@ -14,9 +14,16 @@ from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
 from opentelemetry import trace
 
+from miner.metrics import (
+    metric_pages_released_total,
+    metric_any_request_duration_ms,
+    metric_clean_db_duration_ms,
+)
+
 tracer = trace.get_tracer(__name__)
 
 
+# TODO: add threads
 class App:
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -97,30 +104,28 @@ class App:
                     self.retry_loop += 1
                     span.set_attribute("retry_loop", self.retry_loop)
 
-                    print('oie')
-                    time.sleep(1)
-                    # match self.system_status:
-                    #     case SystemStatus.STARTING:
-                    #         self.logger.info(f'System is starting')
-                    #         self.init_starter()
-                    #     case SystemStatus.RUNNING_STARTER:
-                    #         self.logger.info(f'Waiting to start')
-                    #         time.sleep(1) # just wait until it's ready to mine
-                    #     case SystemStatus.RUNNING_MINING:
-                    #         mine_result = self.mine()
-                    #         if mine_result:
-                    #             self.retry_loop = 0
-                    #     case SystemStatus.COMPLETED:
-                    #         self.logger.info(f'System status is {SystemStatus.COMPLETED}. Quitting')
-                    #     case SystemStatus.ERROR:
-                    #         self.logger.error('Error. Quitting')
-                    #     case _:
-                    #         self.logger.info('Default system status. Quiting.')
-                    #         self._running = False
+                    match self.system_status:
+                        case SystemStatus.STARTING:
+                            self.logger.info(f'System is starting')
+                            self.init_starter()
+                        case SystemStatus.RUNNING_STARTER:
+                            self.logger.info(f'Waiting to start')
+                            time.sleep(1) # just wait until it's ready to mine
+                        case SystemStatus.RUNNING_MINING:
+                            mine_result = self.mine()
+                            if mine_result:
+                                self.retry_loop = 0
+                        case SystemStatus.COMPLETED:
+                            self.logger.info(f'System status is {SystemStatus.COMPLETED}. Quitting')
+                        case SystemStatus.ERROR:
+                            self.logger.error('Error. Quitting')
+                        case _:
+                            self.logger.info('Default system status. Quiting.')
+                            self._running = False
 
-                    # if self.retry_loop >= self.max_retry_loop:
-                    #     span.add_event("max_retry_reached")
-                    #     self._running = False
+                    if self.retry_loop >= self.max_retry_loop:
+                        span.add_event("max_retry_reached")
+                        self._running = False
                 return 0
 
             except Exception as exc:
@@ -146,10 +151,16 @@ class App:
 
     def clean_db(self):
         with tracer.start_as_current_span("app.clean_db") as span:
+            start_timer = time.perf_counter()
             self.logger.info('Cleaning DB')
             total = Page.release_stucked_processing()
+            metric_pages_released_total.add(total, {'service': 'miner'})
             span.set_attribute("db.pages_released", total)
             self.logger.info(f'Released {total} pages')
+            metric_clean_db_duration_ms.record(
+                (time.perf_counter() - start_timer) * 1000,
+                {"service": "miner"}
+            )
 
 
     def mine(self):
@@ -169,5 +180,10 @@ class App:
             requester = Requester()
             requester.prepare(pager)
             with tracer.start_as_current_span("app.requesting") as span_requester:
+                start_timer = time.perf_counter()
                 requester.request()
+                metric_any_request_duration_ms.record(
+                    (time.perf_counter() - start_timer) * 1000,
+                    {"service": "miner"}
+                )
             return True
