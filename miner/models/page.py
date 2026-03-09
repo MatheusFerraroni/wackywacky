@@ -6,6 +6,9 @@ from miner.db import get_connection
 from miner.models.utils import md5_bin16, normalize_url
 from miner.enums.page_status import PageStatus
 from miner.settings.settings_db import SettingsDB
+import threading
+
+lock_claim_next = threading.RLock()
 
 @dataclass
 class Page:
@@ -213,71 +216,72 @@ class Page:
                 params.extend(retryable_statuses)
                 params.append(retry_interval_seconds)
 
-                cur.execute(
-                    f"""
-                    SELECT
-                        p.id,
-                        p.url
-                    FROM pages p
-                    INNER JOIN domain d ON d.id = p.domain_id
-                    WHERE (
-                            p.status = %s
-                            {retry_clause}
-                        )
-                      AND (
-                            d.last_request_at IS NULL
-                            OR d.last_request_at <= (
-                                CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                with lock_claim_next:
+                    cur.execute(
+                        f"""
+                        SELECT
+                            p.id,
+                            p.url
+                        FROM pages p
+                        INNER JOIN domain d ON d.id = p.domain_id
+                        WHERE (
+                                p.status = %s
+                                {retry_clause}
                             )
-                      )
-                    ORDER BY
-                        CASE
-                            WHEN p.status = %s THEN 0
-                            ELSE 1
-                        END,
-                        FLOOR(
-                            TIMESTAMPDIFF(
-                                SECOND,
-                                p.created_at,
-                                CURRENT_TIMESTAMP
-                            ) / 30
-                        ) ASC,
-                        MOD(
-                            CRC32(
-                                CONCAT(
-                                    p.id,
-                                    '-',
-                                    FLOOR(UNIX_TIMESTAMP(CURRENT_TIMESTAMP) / 10)
+                          AND (
+                                d.last_request_at IS NULL
+                                OR d.last_request_at <= (
+                                    CURRENT_TIMESTAMP - INTERVAL %s SECOND
                                 )
-                            ),
-                            1000000
-                        ) ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    [
-                        PageStatus.TODO.value,
-                        *params,
-                        domain_cooldown_seconds,
-                        PageStatus.TODO.value,
-                    ],
-                )
-                row = cur.fetchone()
+                          )
+                        ORDER BY
+                            CASE
+                                WHEN p.status = %s THEN 0
+                                ELSE 1
+                            END,
+                            FLOOR(
+                                TIMESTAMPDIFF(
+                                    SECOND,
+                                    p.created_at,
+                                    CURRENT_TIMESTAMP
+                                ) / 30
+                            ) ASC,
+                            MOD(
+                                CRC32(
+                                    CONCAT(
+                                        p.id,
+                                        '-',
+                                        FLOOR(UNIX_TIMESTAMP(CURRENT_TIMESTAMP) / 10)
+                                    )
+                                ),
+                                1000000
+                            ) ASC
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        [
+                            PageStatus.TODO.value,
+                            *params,
+                            domain_cooldown_seconds,
+                            PageStatus.TODO.value,
+                        ],
+                    )
+                    row = cur.fetchone()
 
-                if not row:
-                    conn.rollback()
-                    return None
+                    if not row:
+                        conn.rollback()
+                        return None
 
-                cur.execute(
-                    """
-                    UPDATE pages
-                    SET status = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (PageStatus.PROCESSING.value, row["id"]),
-                )
+                    cur.execute(
+                        """
+                        UPDATE pages
+                        SET status = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (PageStatus.PROCESSING.value, row["id"]),
+                    )
 
-            conn.commit()
+                conn.commit()
             return row["url"]
 
         except Exception:

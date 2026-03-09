@@ -219,6 +219,8 @@ __marimo__/
 # CUSTOM
 *.DS_Store
 clean_folders.sh
+prepare_resources.sh
+resource_output/
 prometheus_data/
 otel_data/
 mysql_data/

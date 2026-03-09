@@ -47,10 +47,11 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def normalize_url(url: str) -> str:
+    url = url[:8191]
     if not url:
         raise ValueError("URL cannot be empty")
 
-    url = url.strip()
+    url = url.strip().split('#')[0]
 
     if "://" not in url:
         url = "http://" + url

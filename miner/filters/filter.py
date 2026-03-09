@@ -1,5 +1,5 @@
 from functools import lru_cache
-
+import logging
 from miner.models.utils import extract_hostname, md5_bin16
 from miner.models.blocked_domain import BlockedDomain
 from miner.settings.settings import Settings
@@ -7,6 +7,7 @@ from langdetect import detect
 from miner.metrics import metric_domain_check_duration_ms
 import time
 
+logger = logging.getLogger(__name__)
 
 def is_domain_blocked(url_or_domain: str) -> bool:
     start_timer = time.perf_counter()
@@ -29,5 +30,9 @@ def _is_domain_blocked_cached(host: str) -> bool:
     return BlockedDomain.get_by_md5(domain_md5) is not None
 
 def detect_lang(text: str) -> bool:
-    lang = detect(text)
-    return lang in Settings.LANGUAGE_TARGETS
+    try:
+        lang = detect(text)
+        return lang in Settings.LANGUAGE_TARGETS
+    except Exception:
+        logger.info('Failed to detect language')
+        return False

@@ -12,7 +12,7 @@ class Pager:
         self.page: Page | None = None
 
         if self.parent is not None:
-            self.domain = Domain.get_or_create(self.url, self.parent.page.recursion_level)
+            self.domain = Domain.get_or_create(self.url, self.parent.domain.recursion_level)
         else:
             self.domain = Domain.get_or_create(self.url)
 

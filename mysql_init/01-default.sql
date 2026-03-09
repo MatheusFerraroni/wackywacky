@@ -25,10 +25,10 @@ CREATE TABLE `pages` (
   `parent_page_id` INT UNSIGNED NULL,
   `same_as` INT UNSIGNED NULL,
 
-  `url` VARCHAR(2083) NOT NULL,
+  `url` TEXT NOT NULL,
   `url_md5` BINARY(16) NOT NULL,
 
-  `url_final` VARCHAR(2083) NULL,
+  `url_final` TEXT NULL,
   `url_final_md5` BINARY(16) NULL,
 
   `status_code` SMALLINT UNSIGNED NULL,
@@ -145,7 +145,12 @@ INSERT INTO `settings` (`key`, `value`, `description`) VALUES
   (
     'max_recursion',
     JSON_EXTRACT('3', '$'),
-    'Max recursion to discovery new pages'
+    'Max recursion increasing to new domains'
+  ),
+  (
+    'max_recursion_page',
+    JSON_EXTRACT('4', '$'),
+    'Max recursion increasing to new pages, reset every new domain.'
   ),
   (
     'system_status',

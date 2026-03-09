@@ -4,12 +4,18 @@ from miner.enums import PageStatus
 from miner.settings.settings_db import SettingsDB
 import logging
 from urllib.parse import urlparse
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeout,
+    Error as PlaywrightError,
+)
 from miner.pager.pager import Pager
 from miner.models.utils import is_valid_url
 from opentelemetry import trace
-
+from playwright._impl._errors import TargetClosedError
+from contextlib import suppress
 import time
+import asyncio
 
 from miner.metrics import (
     metric_requests_total_started,
@@ -22,7 +28,8 @@ from miner.metrics import (
     metric_pages_saved_total,
     metric_pages_saved_total_with_status,
     metric_request_duration_ms,
-    metric_page_goto_duration_ms
+    metric_page_goto_duration_ms,
+    metric_request_domain_in_cooldown,
 )
 
 
@@ -30,11 +37,12 @@ tracer = trace.get_tracer(__name__)
 
 # TODO: separar recursion level por pagina e por domínio
 class Requester:
-    def __init__(self):
+    def __init__(self, shutdown_event=None):
         self.settingsdb = SettingsDB()
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self.request_timeout_ms = self.settingsdb.get_config('request_timeout_ms')
+        self.shutdown_event = shutdown_event
 
     def prepare(self, pager):
         self.pager = pager
@@ -57,13 +65,20 @@ class Requester:
 
     def _block_unneeded_resources(self, page):
         def route_handler(route):
-            resource_type = route.request.resource_type
-            if resource_type in {"image", "media", "font"}:
-                route.abort()
-            else:
-                route.continue_()
+            try:
+                resource_type = route.request.resource_type
+                if resource_type in {'image', 'media', 'font'}:
+                    route.abort()
+                else:
+                    route.continue_()
+            except asyncio.CancelledError:
+                self.logger.debug('route.abort() with page already aborted: %s', exc)
+                return
+            except (TargetClosedError, PlaywrightError):
+                self.logger.debug('Page aborted due to TargetClosedError, PlaywrightError: %s', exc)
+                return
 
-        page.route("**/*", route_handler)
+        page.route('**/*', route_handler)
 
 
     def _log_context(self, **extra):
@@ -88,37 +103,45 @@ class Requester:
 
     def has_more_recursion_limit(self, pager):
         max_recursion = self.settingsdb.get_config('max_recursion')
-        if pager.domain.recursion_level < max_recursion and pager.page_recursion_level < max_recursion:
-            return True
+        max_recursion_page = self.settingsdb.get_config('max_recursion_page')
+        if pager.domain.recursion_level >= max_recursion:
+            return False
 
-        return False
+        if pager.page_recursion_level >= max_recursion_page:
+            return False
+
+        return True
 
     def request(self):
         with tracer.start_as_current_span("requester.request") as span:
+            page = None
+            context = None
+            browser = None
+            pw = None
             start_timer_request = time.perf_counter()
             metric_requests_total_started.add(1, {"service": "miner"})
             self._log_info(f'Mining')
 
-            with tracer.start_as_current_span("requester.max_retry_attempts") as span_max_retry_attempts:
-                max_allowed_retries = self.settingsdb.get_config('max_retry_attempts')
-                if self.pager.page.retry_count >= max_allowed_retries:
-                    metric_requests_failed_max_retry_total.add(1, {"service": "miner"})
-                    self.pager.page.update(status=PageStatus.FAILED)
-                    self._log_info(f'Too many retries. Status set to {PageStatus.FAILED}')
-                    return
 
-            with tracer.start_as_current_span("requester.recursion_limit") as span_recursion_limit:
-                max_recursion = self.settingsdb.get_config('max_recursion')
-                if not self.has_more_recursion_limit(self.pager):
-                    metric_requests_reached_recursion_limit_total.add(1, {"service": "miner"})
-                    self.pager.page.update(status=PageStatus.BLOCKED_LIMIT_RECURSION)
-                    self._log_info(
-                        f'Max recursion reached. Status set to {PageStatus.BLOCKED_LIMIT_RECURSION.value}',
-                        extra={
-                            'max_recursion': max_recursion
-                        }
-                    )
-                    return
+            max_allowed_retries = self.settingsdb.get_config('max_retry_attempts')
+            if self.pager.page.retry_count >= max_allowed_retries:
+                metric_requests_failed_max_retry_total.add(1, {"service": "miner"})
+                self.pager.page.update(status=PageStatus.FAILED)
+                self._log_info(f'Too many retries. Status set to {PageStatus.FAILED}')
+                return
+
+
+            max_recursion = self.settingsdb.get_config('max_recursion')
+            if not self.has_more_recursion_limit(self.pager):
+                metric_requests_reached_recursion_limit_total.add(1, {"service": "miner"})
+                self.pager.page.update(status=PageStatus.BLOCKED_LIMIT_RECURSION)
+                self._log_info(
+                    f'Max recursion reached. Status set to {PageStatus.BLOCKED_LIMIT_RECURSION.value}',
+                    extra={
+                        'max_recursion': max_recursion
+                    }
+                )
+                return
 
             with tracer.start_as_current_span("requester.blocked_domain") as span_blocked_domain:
                 if is_domain_blocked(self.url):
@@ -127,9 +150,6 @@ class Requester:
                     self._log_info('Halting: domain BLOCKED')
                     return
 
-            context = None
-            page = None
-
             if not self.pager.domain.try_register_request():
                 metric_request_domain_in_cooldown.add(1, {"service": "miner"})
                 self.pager.page.update(status=PageStatus.TODO)
@@ -137,9 +157,15 @@ class Requester:
                 return None
 
             self.pager.page.update(retry_count=self.pager.page.retry_count + 1)
+
+
+            if self.shutdown_event.is_set():
+                self.pager.page.update(status=PageStatus.TODO)
+                return
+
             try:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(
                         headless=True,
                         args=[
                             '--disable-blink-features=AutomationControlled',
@@ -231,25 +257,57 @@ class Requester:
 
                     self._log_info(f'Saved {total_urls_saved} new URLs')
 
-                    context.close()
-                    browser.close()
-
-
                     metric_request_duration_ms.record(
                         (time.perf_counter() - start_timer_request) * 1000,
                         {"service": "miner"}
                     )
                     return True
 
+
             except PlaywrightTimeout:
                 self._log_warning('Timeout error')
+                self.pager.page.update(status=PageStatus.TODO)
+                return None
+
+            except (TargetClosedError, PlaywrightError):
+                if self.shutdown_event and self.shutdown_event.is_set():
+                    self._log_info('Playwright encerrado durante shutdown')
+                    self.pager.page.update(status=PageStatus.TODO)
+                    return None
+
+                self.logger.exception('Playwright falhou fora do shutdown')
+                self.pager.page.update(status=PageStatus.TODO)
+                return None
+
+            except KeyboardInterrupt:
+                self._log_info('Interrompido por sinal')
+                self.pager.page.update(status=PageStatus.TODO)
+                return None
+
+            except AttributeError as e:
+                if '_playwright' in str(e):
+                    if self.shutdown_event and self.shutdown_event.is_set():
+                        self._log_info('Playwright initialization interrupted during shutdown')
+                        self.pager.page.update(status=PageStatus.TODO)
+                        return None
+                    self.logger.exception('Playwright initialization failed')
+                    self.pager.page.update(status=PageStatus.TODO)
+                    return None
+                raise
+
+            except Exception as e:
+                self.logger.exception(f'Generic captured exception: {e}')
                 self.pager.page.update(status=PageStatus.FAILED)
                 return None
 
-            except Exception as e:
-                self.logger.exception(f'{e}')
-                self.pager.page.update(status=PageStatus.FAILED)
-                return None
+            finally:
+                for obj in (page, context, browser):
+                    if obj is not None:
+                        with suppress(Exception):
+                            obj.close()
+                if pw is not None:
+                    with suppress(Exception):
+                        pw.stop()
 
             self._log_error('This log should not be reached.')
             return None
