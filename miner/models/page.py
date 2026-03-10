@@ -10,6 +10,7 @@ import threading
 
 lock_claim_next = threading.RLock()
 
+
 @dataclass
 class Page:
     id: int | None
@@ -45,9 +46,9 @@ class Page:
         url: str,
         recursion_level: int = 0,
         status: PageStatus = PageStatus.TODO,
-    ) -> "Page":
+    ) -> 'Page':
         url = normalize_url(url)
-        st = status.value if hasattr(status, "value") else str(status)
+        st = status.value if hasattr(status, 'value') else str(status)
         return cls(
             id=None,
             domain_id=None,
@@ -83,7 +84,7 @@ class Page:
         self.html_md5 = md5_bin16(html) if html else None
 
     @classmethod
-    def get_by_md5(cls, url_md5: bytes) -> "Page | None":
+    def get_by_md5(cls, url_md5: bytes) -> 'Page | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -107,7 +108,7 @@ class Page:
             return cls(**row) if row else None
 
     @classmethod
-    def get_by_id(cls, page_id: int) -> "Page | None":
+    def get_by_id(cls, page_id: int) -> 'Page | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -140,7 +141,7 @@ class Page:
         same_as: int | None = None,
         recursion_level: int = 0,
         status: PageStatus = PageStatus.TODO,
-    ) -> "Page":
+    ) -> 'Page':
         url = normalize_url(url)
         url_md5 = md5_bin16(url)
 
@@ -148,7 +149,7 @@ class Page:
         if existing:
             return existing
 
-        st = status.value if hasattr(status, "value") else str(status)
+        st = status.value if hasattr(status, 'value') else str(status)
 
         conn = get_connection()
         try:
@@ -166,7 +167,15 @@ class Page:
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (domain_id, parent_page_id, same_as, url, url_md5, recursion_level, st),
+                    (
+                        domain_id,
+                        parent_page_id,
+                        same_as,
+                        url,
+                        url_md5,
+                        recursion_level,
+                        st,
+                    ),
                 )
                 new_id = cur.lastrowid
 
@@ -186,83 +195,56 @@ class Page:
     @classmethod
     def claim_next_todo_url(cls) -> str | None:
         # prevent too many fast requests for the same domain
-        domain_cooldown_ms = SettingsDB().get_config("domain_request_interval_ms")
+        domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
         domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
 
         # allow to retry failed pages after a while
-        retry_interval_ms = SettingsDB().get_config("retry_interval_ms")
+        retry_interval_ms = SettingsDB().get_config('retry_interval_ms')
         retry_interval_seconds = int(retry_interval_ms / 1000)
 
         conn = get_connection()
-
-        retryable_statuses = [
-            PageStatus.FAILED.value,
-        ]
+        max_recursion = SettingsDB().get_config('max_recursion')
+        max_recursion_page = SettingsDB().get_config('max_recursion_page')
+        max_retry_attempts = SettingsDB().get_config('max_retry_attempts')
 
         try:
             with conn.cursor() as cur:
-                params: list[object] = []
-                retry_clause = ""
-
-                placeholders = ", ".join(["%s"] * len(retryable_statuses))
-                retry_clause = f"""
-                    OR (
-                        p.status IN ({placeholders})
-                        AND p.updated_at <= (
-                            CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                        )
-                    )
-                """
-                params.extend(retryable_statuses)
-                params.append(retry_interval_seconds)
-
                 with lock_claim_next:
                     cur.execute(
-                        f"""
+                        """
                         SELECT
                             p.id,
                             p.url
                         FROM pages p
-                        INNER JOIN domain d ON d.id = p.domain_id
-                        WHERE (
-                                p.status = %s
-                                {retry_clause}
-                            )
-                          AND (
+                        INNER JOIN domain d
+                            ON d.id = p.domain_id
+                        WHERE
+                            p.recursion_level < %s
+                            AND d.recursion_level < %s
+                            AND p.retry_count < %s
+                            AND (
                                 d.last_request_at IS NULL
-                                OR d.last_request_at <= (
-                                    CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                )
-                          )
+                                OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                            )
+                            AND p.status IN (%s, %s)
+                            AND (
+                                p.status = %s
+                                OR p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                            )
                         ORDER BY
-                            CASE
-                                WHEN p.status = %s THEN 0
-                                ELSE 1
-                            END,
-                            FLOOR(
-                                TIMESTAMPDIFF(
-                                    SECOND,
-                                    p.created_at,
-                                    CURRENT_TIMESTAMP
-                                ) / 30
-                            ) ASC,
-                            MOD(
-                                CRC32(
-                                    CONCAT(
-                                        p.id,
-                                        '-',
-                                        FLOOR(UNIX_TIMESTAMP(CURRENT_TIMESTAMP) / 10)
-                                    )
-                                ),
-                                1000000
-                            ) ASC
-                        LIMIT 1
+                            (p.status != %s) DESC,
+                            RAND()
                         FOR UPDATE SKIP LOCKED
                         """,
                         [
-                            PageStatus.TODO.value,
-                            *params,
+                            max_recursion_page,
+                            max_recursion,
+                            max_retry_attempts,
                             domain_cooldown_seconds,
+                            PageStatus.TODO.value,
+                            PageStatus.FAILED.value,
+                            PageStatus.TODO.value,
+                            retry_interval_seconds,
                             PageStatus.TODO.value,
                         ],
                     )
@@ -278,11 +260,11 @@ class Page:
                         SET status = %s, updated_at = CURRENT_TIMESTAMP
                         WHERE id = %s
                         """,
-                        (PageStatus.PROCESSING.value, row["id"]),
+                        (PageStatus.PROCESSING.value, row['id']),
                     )
 
                 conn.commit()
-            return row["url"]
+            return row['url']
 
         except Exception:
             conn.rollback()
@@ -309,28 +291,28 @@ class Page:
         new_html_md5: bytes | None = None
 
         if status is not None:
-            st = status.value if hasattr(status, "value") else str(status)
-            sets.append("status = %s")
+            st = status.value if hasattr(status, 'value') else str(status)
+            sets.append('status = %s')
             params.append(st)
             self.status = st
 
         if domain_id is not None:
-            sets.append("domain_id = %s")
+            sets.append('domain_id = %s')
             params.append(domain_id)
             self.domain_id = domain_id
 
         if parent_page_id is not None:
-            sets.append("parent_page_id = %s")
+            sets.append('parent_page_id = %s')
             params.append(parent_page_id)
             self.parent_page_id = parent_page_id
 
         if recursion_level is not None:
-            sets.append("recursion_level = %s")
+            sets.append('recursion_level = %s')
             params.append(recursion_level)
             self.recursion_level = recursion_level
 
         if retry_count is not None:
-            sets.append("retry_count = %s")
+            sets.append('retry_count = %s')
             params.append(retry_count)
             self.retry_count = retry_count
 
@@ -338,49 +320,49 @@ class Page:
             normalized_url_final = normalize_url(url_final)
             new_url_final_md5 = md5_bin16(normalized_url_final)
 
-            sets.append("url_final = %s")
+            sets.append('url_final = %s')
             params.append(normalized_url_final)
-            sets.append("url_final_md5 = %s")
+            sets.append('url_final_md5 = %s')
             params.append(new_url_final_md5)
 
             self.url_final = normalized_url_final
             self.url_final_md5 = new_url_final_md5
 
         if status_code is not None:
-            sets.append("status_code = %s")
+            sets.append('status_code = %s')
             params.append(status_code)
             self.status_code = status_code
 
         if title is not None:
-            sets.append("title = %s")
+            sets.append('title = %s')
             params.append(title)
             self.title = title
 
         if text is not None:
             new_text_md5 = md5_bin16(text)
-            sets.append("text = %s")
+            sets.append('text = %s')
             params.append(text)
-            sets.append("text_md5 = %s")
+            sets.append('text_md5 = %s')
             params.append(new_text_md5)
 
         if html is not None:
             new_html_md5 = md5_bin16(html)
-            sets.append("html = %s")
+            sets.append('html = %s')
             params.append(html)
-            sets.append("html_md5 = %s")
+            sets.append('html_md5 = %s')
             params.append(new_html_md5)
 
         if same_as is not None:
-            sets.append("same_as = %s")
+            sets.append('same_as = %s')
             params.append(same_as)
             self.same_as = same_as
 
         if not sets:
             return 0
 
-        sets.append("updated_at = CURRENT_TIMESTAMP")
+        sets.append('updated_at = CURRENT_TIMESTAMP')
 
-        sql = f"UPDATE pages SET {', '.join(sets)} WHERE url_md5 = %s"
+        sql = f'UPDATE pages SET {", ".join(sets)} WHERE url_md5 = %s'
         args = [*params, self.url_md5]
 
         conn = get_connection()
@@ -400,7 +382,7 @@ class Page:
 
             return int(affected)
 
-        except pymysql.err.IntegrityError as e:
+        except pymysql.err.IntegrityError:
             conn.rollback()
 
             duplicate_page_id = self.get_id_by_text_or_html_md5(
@@ -418,10 +400,11 @@ class Page:
                         """
                         UPDATE pages
                         SET same_as = %s,
+                            status = %s,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE url_md5 = %s
                         """,
-                        (duplicate_page_id, self.url_md5),
+                        (duplicate_page_id, PageStatus.DONE.value, self.url_md5),
                     )
                     affected = cur.rowcount
 
@@ -485,11 +468,11 @@ class Page:
             params: list[object] = []
 
             if text_md5 is not None:
-                clauses.append("text_md5 = %s")
+                clauses.append('text_md5 = %s')
                 params.append(text_md5)
 
             if html_md5 is not None:
-                clauses.append("html_md5 = %s")
+                clauses.append('html_md5 = %s')
                 params.append(html_md5)
 
             sql = f"""
@@ -499,11 +482,11 @@ class Page:
             """
 
             if exclude_id is not None:
-                sql += " AND id <> %s"
+                sql += ' AND id <> %s'
                 params.append(exclude_id)
 
-            sql += " ORDER BY id ASC LIMIT 1"
+            sql += ' ORDER BY id ASC LIMIT 1'
 
             cur.execute(sql, params)
             row = cur.fetchone()
-            return int(row["id"]) if row else None
+            return int(row['id']) if row else None

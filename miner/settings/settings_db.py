@@ -2,7 +2,7 @@ from miner.db import get_connection
 import json
 
 
-class SettingsDB:
+class SettingsDB:  # pylint: disable=too-few-public-methods
     def __init__(self):
         self.configs = {}
 
@@ -13,7 +13,7 @@ class SettingsDB:
         conn = get_connection()
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT value FROM settings WHERE `key` = %s",
+                'SELECT value FROM settings WHERE `key` = %s',
                 (config_name,),
             )
             row = cursor.fetchone()
@@ -21,7 +21,7 @@ class SettingsDB:
         if row is None:
             return None
 
-        value = row["value"]
+        value = row['value']
         if isinstance(value, str):
             value = json.loads(value)
 

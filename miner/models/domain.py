@@ -11,6 +11,7 @@ class Domain:
     id: int | None
     url: str
     url_md5: bytes
+    parent_domain_id: int | None
     recursion_level: int = 0
 
     request_count: int = 0
@@ -20,18 +21,7 @@ class Domain:
     updated_at: datetime | None = None
 
     @classmethod
-    def from_any_url(cls, any_url: str) -> "Domain":
-        dom = extract_hostname(any_url)
-        return cls(
-            id=None,
-            url=dom,
-            url_md5=md5_bin16(dom),
-            recursion_level=0,
-            request_count=0,
-        )
-
-    @classmethod
-    def get_by_md5(cls, url_md5: bytes) -> "Domain | None":
+    def get_by_md5(cls, url_md5: bytes) -> 'Domain | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -40,6 +30,7 @@ class Domain:
                     id,
                     url,
                     url_md5,
+                    parent_domain_id,
                     recursion_level,
                     request_count,
                     last_request_at,
@@ -55,7 +46,8 @@ class Domain:
             return cls(**row) if row else None
 
     @classmethod
-    def get_or_create(cls, any_url: str, recursion_level: int = 0) -> "Domain":
+    def get_or_create(cls, any_url: str, parent_pager) -> 'Domain':
+
         dom = extract_hostname(any_url)
         dom_md5 = md5_bin16(dom)
 
@@ -63,15 +55,18 @@ class Domain:
         if existing:
             return existing
 
+        recursion_level = parent_pager.domain.recursion_level if parent_pager is not None else 0
+        parent_id = parent_pager.domain.id if parent_pager is not None else None
+
         conn = get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO domain (url, url_md5, recursion_level)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO domain (url, url_md5, recursion_level, parent_domain_id)
+                    VALUES (%s, %s, %s, %s)
                     """,
-                    (dom, dom_md5, recursion_level),
+                    (dom, dom_md5, recursion_level, parent_id),
                 )
                 new_id = cur.lastrowid
 
@@ -91,7 +86,7 @@ class Domain:
             raise
 
     @classmethod
-    def get_by_id(cls, domain_id: int) -> "Domain | None":
+    def get_by_id(cls, domain_id: int) -> 'Domain | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -100,6 +95,7 @@ class Domain:
                     id,
                     url,
                     url_md5,
+                    parent_domain_id,
                     recursion_level,
                     request_count,
                     last_request_at,
@@ -114,9 +110,8 @@ class Domain:
             row = cur.fetchone()
             return cls(**row) if row else None
 
-
     def try_register_request(self) -> bool:
-        domain_cooldown_ms = SettingsDB().get_config("domain_request_interval_ms")
+        domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
         domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
         conn = get_connection()
         try:

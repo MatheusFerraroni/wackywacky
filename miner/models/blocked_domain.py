@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from datetime import datetime
-import pymysql
 
 from miner.db import get_connection
 from miner.models.utils import md5_bin16, extract_hostname
@@ -17,7 +16,7 @@ class BlockedDomain:
     updated_at: datetime | None = None
 
     @classmethod
-    def from_domain(cls, any_url_or_domain: str, reason: str | None = None) -> "BlockedDomain":
+    def from_domain(cls, any_url_or_domain: str, reason: str | None = None) -> 'BlockedDomain':
         dom = extract_hostname(any_url_or_domain)
         return cls(
             id=None,
@@ -27,7 +26,7 @@ class BlockedDomain:
         )
 
     @classmethod
-    def get_by_md5(cls, domain_md5: bytes) -> "BlockedDomain | None":
+    def get_by_md5(cls, domain_md5: bytes) -> 'BlockedDomain | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -49,13 +48,13 @@ class BlockedDomain:
             return cls(**row) if row else None
 
     @classmethod
-    def get_by_domain(cls, domain: str) -> "BlockedDomain | None":
+    def get_by_domain(cls, domain: str) -> 'BlockedDomain | None':
         dom = extract_hostname(domain)
         dom_md5 = md5_bin16(dom)
         return cls.get_by_md5(dom_md5)
 
     @classmethod
-    def get_by_id(cls, blocked_id: int) -> "BlockedDomain | None":
+    def get_by_id(cls, blocked_id: int) -> 'BlockedDomain | None':
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(

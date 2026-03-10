@@ -30,9 +30,9 @@ _telemetry_initialized = False
 def _build_resource() -> Resource:
     return Resource.create(
         {
-            "service.name": Settings.OTEL_SERVICE_NAME,
-            "service.version": Settings.OTEL_SERVICE_VERSION,
-            "deployment.environment": Settings.OTEL_ENV,
+            'service.name': Settings.OTEL_SERVICE_NAME,
+            'service.version': Settings.OTEL_SERVICE_VERSION,
+            'deployment.environment': Settings.OTEL_ENV,
         }
     )
 
@@ -48,14 +48,18 @@ def _normalize_endpoint(base_or_signal_endpoint: Optional[str], signal_path: str
     - http://otel-collector:4318/v1/logs
     """
     if not base_or_signal_endpoint:
-        raise ValueError(f"Missing OTLP endpoint for {signal_path}")
+        raise ValueError(f'Missing OTLP endpoint for {signal_path}')
 
-    endpoint = base_or_signal_endpoint.rstrip("/")
+    endpoint = base_or_signal_endpoint.rstrip('/')
 
-    if endpoint.endswith("/v1/traces") or endpoint.endswith("/v1/logs") or endpoint.endswith("/v1/metrics"):
+    if (
+        endpoint.endswith('/v1/traces')
+        or endpoint.endswith('/v1/logs')
+        or endpoint.endswith('/v1/metrics')
+    ):
         return endpoint
 
-    return f"{endpoint}/{signal_path.lstrip('/')}"
+    return f'{endpoint}/{signal_path.lstrip("/")}'
 
 
 def setup_telemetry() -> None:
@@ -71,8 +75,8 @@ def setup_telemetry() -> None:
 
     # TRACE EXPORT
     traces_endpoint = _normalize_endpoint(
-        getattr(Settings, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None),
-        "/v1/traces",
+        getattr(Settings, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', None),
+        '/v1/traces',
     )
 
     tracer_provider = TracerProvider(resource=resource)
@@ -83,10 +87,10 @@ def setup_telemetry() -> None:
     # METRICS EXPORT
     metrics_endpoint_setting = getattr(
         Settings,
-        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        getattr(Settings, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None),
+        'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT',
+        getattr(Settings, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', None),
     )
-    metrics_endpoint = _normalize_endpoint(metrics_endpoint_setting, "/v1/metrics")
+    metrics_endpoint = _normalize_endpoint(metrics_endpoint_setting, '/v1/metrics')
 
     metric_reader = PeriodicExportingMetricReader(
         OTLPMetricExporter(endpoint=metrics_endpoint),
@@ -105,10 +109,10 @@ def setup_telemetry() -> None:
     # Caso não tenha, reaproveita o endpoint de traces trocando para /v1/logs.
     logs_endpoint_setting = getattr(
         Settings,
-        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-        getattr(Settings, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None),
+        'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
+        getattr(Settings, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', None),
     )
-    logs_endpoint = _normalize_endpoint(logs_endpoint_setting, "/v1/logs")
+    logs_endpoint = _normalize_endpoint(logs_endpoint_setting, '/v1/logs')
 
     logger_provider = LoggerProvider(resource=resource)
     log_exporter = OTLPLogExporter(endpoint=logs_endpoint)

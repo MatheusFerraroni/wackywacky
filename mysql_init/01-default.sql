@@ -5,6 +5,8 @@ CREATE TABLE `domain` (
   `url` VARCHAR(2083) NOT NULL,
   `url_md5` BINARY(16) NOT NULL,
 
+  `parent_domain_id` INT UNSIGNED NULL,
+
   `recursion_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,
 
   `request_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -14,7 +16,14 @@ CREATE TABLE `domain` (
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
   UNIQUE KEY `uq_domain_url_md5` (`url_md5`),
-  KEY `idx_domain_last_request_at` (`last_request_at`)
+  KEY `idx_domain_last_request_at` (`last_request_at`),
+  KEY `idx_domain_parent_domain_id` (`parent_domain_id`),
+
+  CONSTRAINT `fk_domain_parent`
+    FOREIGN KEY (`parent_domain_id`)
+    REFERENCES `domain` (`id`)
+    ON DELETE SET NULL
+    ON UPDATE CASCADE
 ) ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_0900_ai_ci;

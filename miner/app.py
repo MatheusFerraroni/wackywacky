@@ -14,7 +14,8 @@ from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
 from opentelemetry import trace
 import threading
-import random
+from miner.enums import PageStatus
+
 
 from miner.metrics import (
     metric_pages_released_total,
@@ -24,12 +25,13 @@ from miner.metrics import (
 
 tracer = trace.get_tracer(__name__)
 
+
 # TODO: lint
 class App:
-    def __init__(self) -> None:
+    def __init__(self, reset_db=False) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._running = True
-        
+
         self.last_clean_db = None
 
         self.retry_loop = 0
@@ -42,6 +44,28 @@ class App:
 
         self.last_log_threads = None
 
+        if reset_db:
+            self.reset_db()
+
+    def reset_db(self):
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('SET FOREIGN_KEY_CHECKS = 0')
+            try:
+                cursor.execute('TRUNCATE TABLE pages')
+                cursor.execute('TRUNCATE TABLE domain')
+                cursor.execute(
+                    """
+                    UPDATE settings
+                    SET value = %s
+                    WHERE `key` = %s
+                    """,
+                    ('"starting"', 'system_status'),
+                )
+            finally:
+                cursor.execute('SET FOREIGN_KEY_CHECKS = 1')
+        conn.commit()
+
     def _handle_shutdown_signal(self, signum: int, _frame) -> None:
         self.logger.info('Starting graceful shutdown (signal=%s)', signum)
         self._running = False
@@ -52,7 +76,7 @@ class App:
         signal.signal(signal.SIGTERM, self._handle_shutdown_signal)
 
     def get_system_status(self) -> SystemStatus:
-        with tracer.start_as_current_span('app.get_system_status') as span:
+        with tracer.start_as_current_span('app.get_system_status'):
             raw = SettingsDB().get_config('system_status', refresh=True)
 
             if raw is None:
@@ -64,13 +88,13 @@ class App:
             if isinstance(raw, str):
                 try:
                     return SystemStatus(raw.lower())
-                except ValueError as e:
+                except ValueError:
                     return SystemStatus.ERROR
 
             return SystemStatus.ERROR
 
     def set_system_status(self, status):
-        with tracer.start_as_current_span('app.set_system_status') as span:
+        with tracer.start_as_current_span('app.set_system_status'):
             if isinstance(status, SystemStatus):
                 normalized = status.value
             else:
@@ -101,23 +125,22 @@ class App:
                     if not self.last_clean_db:
                         should_clean_db = True
                     else:
-                        total_seconds = ( datetime.now() - self.last_clean_db).total_seconds()
+                        total_seconds = (datetime.now() - self.last_clean_db).total_seconds()
                         if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
                             should_clean_db = True
-                    
+
                     if should_clean_db:
                         self.last_clean_db = datetime.now()
                         self.clean_db()
-
 
                     should_log_threads = False
                     if not self.last_log_threads:
                         should_log_threads = True
                     else:
-                        total_seconds = ( datetime.now() - self.last_log_threads).total_seconds()
+                        total_seconds = (datetime.now() - self.last_log_threads).total_seconds()
                         if total_seconds > settings.SECONDS_BETWEEN_LOG_THREADS:
                             should_log_threads = True
-                    
+
                     if should_log_threads:
                         self.last_log_threads = datetime.now()
                         self._log_thread_stats()
@@ -129,15 +152,15 @@ class App:
 
                     match self.system_status:
                         case SystemStatus.STARTING:
-                            self.logger.info(f'System is starting')
+                            self.logger.info('System is starting')
                             self.init_starter()
                         case SystemStatus.RUNNING_STARTER:
-                            self.logger.info(f'Waiting to start')
-                            time.sleep(1) # just wait until it's ready to mine
+                            self.logger.info('Waiting to start')
+                            time.sleep(1)  # just wait until it's ready to mine
                         case SystemStatus.RUNNING_MINING:
                             started = self.mine()
 
-                            with self.threads_lock: # prevent early stop with long running threads
+                            with self.threads_lock:  # prevent early stop with long running threads
                                 if len(self.threads) > 0:
                                     continue
 
@@ -198,8 +221,7 @@ class App:
             span.set_attribute('db.pages_released', total)
             self.logger.info(f'Released {total} pages')
             metric_clean_db_duration_ms.record(
-                (time.perf_counter() - start_timer) * 1000,
-                {'service': 'miner'}
+                (time.perf_counter() - start_timer) * 1000, {'service': 'miner'}
             )
 
     def mine(self) -> bool:
@@ -220,17 +242,13 @@ class App:
 
             for _ in range(available_slots):
                 self.worker_id += 1
-                time.sleep(random.random()) # random sleep to reduce concorrence at start
-                t = threading.Thread(
-                    target=self._mine, 
-                    name=f'miner-worker-{self.worker_id}'
-                )
+                time.sleep(random.random())  # random sleep to reduce concorrence at start
+                t = threading.Thread(target=self._mine, name=f'miner-worker-{self.worker_id}')
                 t.start()
                 self.threads.append(t)
                 started_any = True
 
             return started_any
-
 
     def _mine(self):
         try:
@@ -247,7 +265,10 @@ class App:
                             claim_counter += 1
                             with self.lock_claim_url:
                                 url = Page.claim_next_todo_url()
-                            time.sleep(1)
+
+                            if url is not None:
+                                break
+                            time.sleep(0.5 + random.random())
 
                         if self.shutdown_event.is_set():
                             return
@@ -267,12 +288,12 @@ class App:
 
                         requester = Requester(shutdown_event=self.shutdown_event)
                         requester.prepare(pager)
-                        with tracer.start_as_current_span('app.requesting') as span_requester:
+                        with tracer.start_as_current_span('app.requesting'):
                             start_timer = time.perf_counter()
                             requester.request()
                             metric_any_request_duration_ms.record(
                                 (time.perf_counter() - start_timer) * 1000,
-                                {'service': 'miner'}
+                                {'service': 'miner'},
                             )
                 except Exception:
                     self.logger.exception('Unhandled exception in miner thread')
@@ -289,7 +310,7 @@ class App:
             thread_names = [t.name for t in self.threads if t.is_alive()]
 
         self.logger.info(
-            "Thread pool stats | total=%s alive=%s dead=%s threads=%s",
+            'Thread pool stats | total=%s alive=%s dead=%s threads=%s',
             total,
             alive,
             dead,
