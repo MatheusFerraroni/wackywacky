@@ -6,6 +6,7 @@ from miner.db import get_connection
 from miner.models.utils import md5_bin16, normalize_url
 from miner.enums.page_status import PageStatus
 from miner.settings.settings_db import SettingsDB
+from miner.metrics import metric_pages_marked_as_same_as
 import threading
 
 lock_claim_next = threading.RLock()
@@ -410,6 +411,7 @@ class Page:
 
                 conn.commit()
                 self.same_as = duplicate_page_id
+                metric_pages_marked_as_same_as.add(1, {'service': 'miner'})
                 return int(affected)
 
             except Exception:

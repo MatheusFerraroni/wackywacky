@@ -15,18 +15,21 @@ from miner.settings.settings import settings
 from opentelemetry import trace
 import threading
 from miner.enums import PageStatus
+from contextlib import suppress
 
 
 from miner.metrics import (
-    metric_pages_released_total,
-    metric_any_request_duration_ms,
-    metric_clean_db_duration_ms,
+    metric_pages_released,
+    metric_any_request_duration,
+    metric_clean_db_duration,
+    metric_threads_alive,
 )
+
+from playwright.sync_api import sync_playwright
 
 tracer = trace.get_tracer(__name__)
 
 
-# TODO: lint
 class App:
     def __init__(self, reset_db=False) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -43,11 +46,13 @@ class App:
         self.worker_id = 0
 
         self.last_log_threads = None
+        self._last_threads_alive = 0
 
         if reset_db:
             self.reset_db()
 
     def reset_db(self):
+        self.logger.info('Cleaning DB started')
         conn = get_connection()
         with conn.cursor() as cursor:
             cursor.execute('SET FOREIGN_KEY_CHECKS = 0')
@@ -66,6 +71,20 @@ class App:
                 cursor.execute('SET FOREIGN_KEY_CHECKS = 1')
         conn.commit()
 
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT COUNT(1) AS total FROM pages')
+            pages_count = cursor.fetchone()['total']
+
+            cursor.execute('SELECT COUNT(1) AS total FROM domain')
+            domain_count = cursor.fetchone()['total']
+
+        if pages_count != 0 or domain_count != 0:
+            raise RuntimeError(
+                f'Database reset validation failed: pages={pages_count}, domain={domain_count}'
+            )
+
+        self.logger.info('Cleaning DB completed')
+
     def _handle_shutdown_signal(self, signum: int, _frame) -> None:
         self.logger.info('Starting graceful shutdown (signal=%s)', signum)
         self._running = False
@@ -76,6 +95,10 @@ class App:
         signal.signal(signal.SIGTERM, self._handle_shutdown_signal)
 
     def get_system_status(self) -> SystemStatus:
+
+        if self.shutdown_event.is_set():
+            return SystemStatus.STOPPING
+
         with tracer.start_as_current_span('app.get_system_status'):
             raw = SettingsDB().get_config('system_status', refresh=True)
 
@@ -171,6 +194,9 @@ class App:
                         case SystemStatus.COMPLETED:
                             self.logger.info(f'System status is {SystemStatus.COMPLETED}. Quitting')
                             self._running = False
+                        case SystemStatus.STOPPING:
+                            self.logger.info(f'System status is {SystemStatus.STOPPING}. Quitting')
+                            self._running = False
                         case SystemStatus.ERROR:
                             self.logger.error('Error. Quitting')
                             self._running = False
@@ -192,11 +218,9 @@ class App:
                 self.logger.info('Waiting miner threads to finish')
                 with self.threads_lock:
                     threads_snapshot = list(self.threads)
-
                 for t in threads_snapshot:
-                    t.join(timeout=5)
+                    t.join(timeout=1)
                 close_connection()
-
                 self.logger.info('Graceful shutdown completed')
 
     def init_starter(self):
@@ -215,13 +239,13 @@ class App:
     def clean_db(self):
         with tracer.start_as_current_span('app.clean_db') as span:
             start_timer = time.perf_counter()
-            self.logger.info('Cleaning DB')
+            self.logger.info('Releasing stucked pages DB')
             total = Page.release_stucked_processing()
-            metric_pages_released_total.add(total, {'service': 'miner'})
+            metric_pages_released.add(total, {'service': 'miner'})
             span.set_attribute('db.pages_released', total)
             self.logger.info(f'Released {total} pages')
-            metric_clean_db_duration_ms.record(
-                (time.perf_counter() - start_timer) * 1000, {'service': 'miner'}
+            metric_clean_db_duration.record(
+                (time.perf_counter() - start_timer), {'service': 'miner'}
             )
 
     def mine(self) -> bool:
@@ -250,54 +274,109 @@ class App:
 
             return started_any
 
+    def _build_context(self, browser):
+        user_agent = (
+            'Mozilla/5.0 (X11; Linux x86_64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/122.0.0.0 Safari/537.36'
+        )
+
+        return browser.new_context(
+            user_agent=user_agent,
+            java_script_enabled=True,
+            ignore_https_errors=True,
+            viewport={'width': 1366, 'height': 768},
+        )
+
+    def _block_unneeded_resources(self, page):
+        def route_handler(route):
+            try:
+                resource_type = route.request.resource_type
+                if resource_type in {'image', 'media', 'font'}:
+                    route.abort()
+                else:
+                    route.continue_()
+            except Exception:
+                return
+
+        page.route('**/*', route_handler)
+
     def _mine(self):
+
+        page = None
+        context = None
+        browser = None
+
         try:
-            with tracer.start_as_current_span('app.mine') as span:
-                try:
-                    while not self.shutdown_event.is_set():
-                        self.logger.info('Miner started')
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                    ],
+                )
+                context = self._build_context(browser)
+                page = context.new_page()
+                self._block_unneeded_resources(page)
 
-                        claim_counter = 0
-                        claim_limit = 10
-                        url = None
+                with tracer.start_as_current_span('app.mine') as span:
+                    try:
+                        while not self.shutdown_event.is_set():
+                            self.logger.info('Miner started')
 
-                        while claim_counter < claim_limit and not self.shutdown_event.is_set():
-                            claim_counter += 1
-                            with self.lock_claim_url:
-                                url = Page.claim_next_todo_url()
+                            claim_counter = 0
+                            claim_limit = 10
+                            url = None
 
-                            if url is not None:
-                                break
-                            time.sleep(0.5 + random.random())
+                            while claim_counter < claim_limit and not self.shutdown_event.is_set():
+                                claim_counter += 1
+                                with self.lock_claim_url:
+                                    url = Page.claim_next_todo_url()
 
-                        if self.shutdown_event.is_set():
-                            return
+                                if url is not None:
+                                    break
+                                time.sleep(random.random() * 0.1)
 
-                        if url is None:
-                            span.add_event('nothing_to_mine')
-                            self.logger.warning('Nothing to mine')
-                            return
+                            if self.shutdown_event.is_set():
+                                return
 
-                        span.set_attribute('page.url', url)
-                        pager = Pager(url)
-                        pager.load()
+                            if url is None:
+                                span.add_event('nothing_to_mine')
+                                self.logger.warning('Nothing to mine')
+                                return
 
-                        if self.shutdown_event.is_set():
-                            pager.page.update(status=PageStatus.TODO)
-                            return
+                            span.set_attribute('page.url', url)
+                            pager = Pager(url)
+                            pager.load()
 
-                        requester = Requester(shutdown_event=self.shutdown_event)
-                        requester.prepare(pager)
-                        with tracer.start_as_current_span('app.requesting'):
-                            start_timer = time.perf_counter()
-                            requester.request()
-                            metric_any_request_duration_ms.record(
-                                (time.perf_counter() - start_timer) * 1000,
-                                {'service': 'miner'},
-                            )
-                except Exception:
-                    self.logger.exception('Unhandled exception in miner thread')
+                            if self.shutdown_event.is_set():
+                                pager.page.update(status=PageStatus.TODO)
+                                return
+
+                            requester = Requester(shutdown_event=self.shutdown_event)
+                            requester.prepare(pager)
+                            with tracer.start_as_current_span('app.requesting'):
+                                start_timer = time.perf_counter()
+                                requester.request(page)
+                                metric_any_request_duration.record(
+                                    (time.perf_counter() - start_timer),
+                                    {'service': 'miner'},
+                                )
+                    except Exception:
+                        self.logger.exception('Unhandled exception in miner thread')
+
         finally:
+            if page is not None:
+                with suppress(Exception):
+                    page.close()
+            if context is not None:
+                with suppress(Exception):
+                    context.close()
+            if browser is not None:
+                with suppress(Exception):
+                    browser.close()
             close_connection()
             self.logger.info('Quitting Worker')
 
@@ -308,6 +387,10 @@ class App:
             dead = total - alive
 
             thread_names = [t.name for t in self.threads if t.is_alive()]
+
+        delta = alive - self._last_threads_alive
+        metric_threads_alive.add(delta, {'service': 'miner'})
+        self._last_threads_alive = alive
 
         self.logger.info(
             'Thread pool stats | total=%s alive=%s dead=%s threads=%s',

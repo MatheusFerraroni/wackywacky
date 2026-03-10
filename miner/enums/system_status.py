@@ -7,6 +7,7 @@ class SystemStatus(Enum):
     RUNNING_MINING = 'running_mining'
     COMPLETED = 'completed'
     ERROR = 'error'
+    STOPPING = 'stopping'
 
     def __str__(self) -> str:
         return self.value

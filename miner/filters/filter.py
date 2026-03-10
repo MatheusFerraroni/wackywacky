@@ -4,7 +4,7 @@ from miner.models.utils import extract_hostname, md5_bin16
 from miner.models.blocked_domain import BlockedDomain
 from miner.settings.settings import Settings
 from langdetect import detect
-from miner.metrics import metric_domain_check_duration_ms
+from miner.metrics import metric_domain_check_duration
 import time
 
 logger = logging.getLogger(__name__)
@@ -18,9 +18,7 @@ def is_domain_blocked(url_or_domain: str) -> bool:
 
     ret = _is_domain_blocked_cached(host)
 
-    metric_domain_check_duration_ms.record(
-        (time.perf_counter() - start_timer) * 1000, {'service': 'miner'}
-    )
+    metric_domain_check_duration.record((time.perf_counter() - start_timer), {'service': 'miner'})
     return ret
 
 
