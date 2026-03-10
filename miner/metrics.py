@@ -96,3 +96,9 @@ metric_domain_check_duration = meter.create_histogram(
     unit='s',
     description='Duration of domain check',
 )
+
+metric_saving_found_hrefs_duration = meter.create_histogram(
+    'saving_found_hrefs_duration',
+    unit='s',
+    description='Duration of saving hrefs',
+)

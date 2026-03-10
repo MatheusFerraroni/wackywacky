@@ -22,6 +22,7 @@ from miner.metrics import (
     metric_request_duration,
     metric_page_goto_duration,
     metric_request_domain_in_cooldown,
+    metric_saving_found_hrefs_duration,
 )
 
 
@@ -39,33 +40,6 @@ class Requester:
     def prepare(self, pager):
         self.pager = pager
         self.url = self.pager.page.url
-
-    # def _build_context(self, browser):
-    #     user_agent = (
-    #         'Mozilla/5.0 (X11; Linux x86_64) '
-    #         'AppleWebKit/537.36 (KHTML, like Gecko) '
-    #         'Chrome/122.0.0.0 Safari/537.36'
-    #     )
-
-    #     return browser.new_context(
-    #         user_agent=user_agent,
-    #         java_script_enabled=True,
-    #         ignore_https_errors=True,
-    #         viewport={'width': 1366, 'height': 768},
-    #     )
-
-    # def _block_unneeded_resources(self, page):
-    #     def route_handler(route):
-    #         try:
-    #             resource_type = route.request.resource_type
-    #             if resource_type in {'image', 'media', 'font'}:
-    #                 route.abort()
-    #             else:
-    #                 route.continue_()
-    #         except Exception:
-    #             return
-
-    #     page.route('**/*', route_handler)
 
     def _log_context(self, **extra):
         context = {
@@ -101,9 +75,6 @@ class Requester:
 
     def request(self, page):
         with tracer.start_as_current_span('requester.request'):
-            # page = None
-            # context = None
-            # browser = None
             start_timer_request = time.perf_counter()
             metric_requests_started.add(1, {'service': 'miner'})
             self._log_info('Mining')
@@ -145,19 +116,6 @@ class Requester:
                 return
 
             try:
-                # with sync_playwright() as pw:
-                # browser = pw.chromium.launch(
-                #     headless=True,
-                #     args=[
-                #         '--disable-blink-features=AutomationControlled',
-                #         '--no-sandbox',
-                #         '--disable-dev-shm-usage',
-                #     ],
-                # )
-
-                # context = self._build_context(browser)
-                # page = context.new_page()
-                # self._block_unneeded_resources(page)
 
                 with tracer.start_as_current_span('requester.page_goto'):
                     try:
@@ -223,6 +181,7 @@ class Requester:
 
                 with tracer.start_as_current_span('requester.saving_hrefs'):
                     total_urls_saved = 0
+                    start_timer_saving_hrefs = time.perf_counter()
                     for found_url in hrefs:
                         if is_valid_url(found_url):
                             created_page = Pager(url=found_url, parent=self.pager)
@@ -265,6 +224,12 @@ class Requester:
                                         'status': PageStatus.TODO.value,
                                     },
                                 )
+
+
+                    metric_saving_found_hrefs_duration.record(
+                        (time.perf_counter() - start_timer_saving_hrefs),
+                        {'service': 'miner'},
+                    )
 
                 self._log_info(f'Saved {total_urls_saved} new URLs')
 
@@ -312,18 +277,6 @@ class Requester:
 
             finally:
                 pass
-                # if page is not None:
-                #     with suppress(Exception):
-                #         page.unroute("**/*")
-                # if page is not None:
-                #     with suppress(Exception):
-                #         page.close()
-                # if context is not None:
-                #     with suppress(Exception):
-                #         context.close()
-                # if browser is not None:
-                #     with suppress(Exception):
-                #         browser.close()
 
             self._log_error('This log should not be reached.')
             return None

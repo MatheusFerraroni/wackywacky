@@ -7,11 +7,28 @@ from miner.models.utils import md5_bin16, normalize_url
 from miner.enums.page_status import PageStatus
 from miner.settings.settings_db import SettingsDB
 from miner.metrics import metric_pages_marked_as_same_as
+import zstandard as zstd
 import threading
 
 lock_claim_next = threading.RLock()
 
+_ZSTD_LEVEL = 11
+_zstd_compressor = zstd.ZstdCompressor(level=_ZSTD_LEVEL)
+_zstd_decompressor = zstd.ZstdDecompressor()
 
+def _compress_str(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    return _zstd_compressor.compress(value.encode("utf-8"))
+
+
+def _decompress_str(value: bytes | None) -> str | None:
+    if value is None:
+        return None
+    return _zstd_decompressor.decompress(value).decode("utf-8")
+
+
+# TODO: compression with zstd
 @dataclass
 class Page:
     id: int | None
@@ -40,6 +57,30 @@ class Page:
 
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @classmethod
+    def from_db_row(cls, row: dict) -> 'Page':
+        return cls(
+            id=row["id"],
+            domain_id=row["domain_id"],
+            parent_page_id=row["parent_page_id"],
+            same_as=row["same_as"],
+            url=row["url"],
+            url_md5=row["url_md5"],
+            url_final=row["url_final"],
+            url_final_md5=row["url_final_md5"],
+            status_code=row["status_code"],
+            title=row["title"],
+            recursion_level=row["recursion_level"],
+            status=row["status"],
+            retry_count=row["retry_count"],
+            text=_decompress_str(row["text"]) if row["text"] is not None else None,
+            text_md5=row["text_md5"],
+            html=_decompress_str(row["html"]) if row["html"] is not None else None,
+            html_md5=row["html_md5"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     @classmethod
     def from_url(
@@ -106,7 +147,7 @@ class Page:
                 (url_md5,),
             )
             row = cur.fetchone()
-            return cls(**row) if row else None
+            return cls.from_db_row(row) if row else None
 
     @classmethod
     def get_by_id(cls, page_id: int) -> 'Page | None':
@@ -130,7 +171,7 @@ class Page:
                 (page_id,),
             )
             row = cur.fetchone()
-            return cls(**row) if row else None
+            return cls.from_db_row(row) if row else None
 
     @classmethod
     def get_or_create(
@@ -342,14 +383,14 @@ class Page:
         if text is not None:
             new_text_md5 = md5_bin16(text)
             sets.append('text = %s')
-            params.append(text)
+            params.append(_compress_str(text))
             sets.append('text_md5 = %s')
             params.append(new_text_md5)
 
         if html is not None:
             new_html_md5 = md5_bin16(html)
             sets.append('html = %s')
-            params.append(html)
+            params.append(_compress_str(html))
             sets.append('html_md5 = %s')
             params.append(new_html_md5)
 
