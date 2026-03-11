@@ -261,7 +261,8 @@ class Page:
                         """
                         SELECT
                             p.id,
-                            p.url
+                            p.url,
+                            d.id as domain_id
                         FROM pages p
                         INNER JOIN domain d
                             ON d.id = p.domain_id
@@ -308,6 +309,15 @@ class Page:
                         WHERE id = %s
                         """,
                         (PageStatus.PROCESSING.value, row['id']),
+                    )
+
+                    cur.execute(
+                        """
+                        UPDATE domain
+                        SET updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (row['domain_id']),
                     )
 
                 conn.commit()
