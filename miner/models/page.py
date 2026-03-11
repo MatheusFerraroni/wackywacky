@@ -17,16 +17,17 @@ _ZSTD_LEVEL = 11
 _zstd_compressor = zstd.ZstdCompressor(level=_ZSTD_LEVEL)
 _zstd_decompressor = zstd.ZstdDecompressor()
 
+
 def _compress_str(value: str | None) -> bytes | None:
     if value is None:
         return None
-    return _zstd_compressor.compress(value.encode("utf-8"))
+    return _zstd_compressor.compress(value.encode('utf-8'))
 
 
 def _decompress_str(value: bytes | None) -> str | None:
     if value is None:
         return None
-    return _zstd_decompressor.decompress(value).decode("utf-8")
+    return _zstd_decompressor.decompress(value).decode('utf-8')
 
 
 # TODO: compression with zstd
@@ -62,25 +63,25 @@ class Page:
     @classmethod
     def from_db_row(cls, row: dict) -> 'Page':
         return cls(
-            id=row["id"],
-            domain_id=row["domain_id"],
-            parent_page_id=row["parent_page_id"],
-            same_as=row["same_as"],
-            url=row["url"],
-            url_md5=row["url_md5"],
-            url_final=row["url_final"],
-            url_final_md5=row["url_final_md5"],
-            status_code=row["status_code"],
-            title=row["title"],
-            recursion_level=row["recursion_level"],
-            status=row["status"],
-            retry_count=row["retry_count"],
-            text=_decompress_str(row["text"]) if row["text"] is not None else None,
-            text_md5=row["text_md5"],
-            html=_decompress_str(row["html"]) if row["html"] is not None else None,
-            html_md5=row["html_md5"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            id=row['id'],
+            domain_id=row['domain_id'],
+            parent_page_id=row['parent_page_id'],
+            same_as=row['same_as'],
+            url=row['url'],
+            url_md5=row['url_md5'],
+            url_final=row['url_final'],
+            url_final_md5=row['url_final_md5'],
+            status_code=row['status_code'],
+            title=row['title'],
+            recursion_level=row['recursion_level'],
+            status=row['status'],
+            retry_count=row['retry_count'],
+            text=_decompress_str(row['text']) if row['text'] is not None else None,
+            text_md5=row['text_md5'],
+            html=_decompress_str(row['html']) if row['html'] is not None else None,
+            html_md5=row['html_md5'],
+            created_at=row['created_at'],
+            updated_at=row['updated_at'],
         )
 
     @classmethod
@@ -121,7 +122,7 @@ class Page:
     def set_text(self, text: str | None) -> None:
         if text is None:
             return
-        self.text = text[:settings.MAX_CHARACTERS_TEXT]
+        self.text = text[: settings.MAX_CHARACTERS_TEXT]
         self.text_md5 = md5_bin16(self.text) if self.text else None
 
     def set_html(self, html: str | None) -> None:
@@ -396,7 +397,7 @@ class Page:
             self.title = title
 
         if text is not None:
-            text = text[:settings.MAX_CHARACTERS_TEXT]
+            text = text[: settings.MAX_CHARACTERS_TEXT]
             new_text_md5 = md5_bin16(text)
             sets.append('text = %s')
             params.append(_compress_str(text))
@@ -431,7 +432,7 @@ class Page:
             conn.commit()
 
             if text is not None:
-                self.text = text[:settings.MAX_CHARACTERS_TEXT]
+                self.text = text[: settings.MAX_CHARACTERS_TEXT]
                 self.text_md5 = new_text_md5
 
             if html is not None and settings.SAVE_HTML:

@@ -8,6 +8,7 @@ from miner.models.utils import is_valid_url
 from opentelemetry import trace
 from playwright._impl._errors import TargetClosedError
 import time
+import threading
 
 from miner.metrics import (
     metric_requests_started,
@@ -74,13 +75,27 @@ class Requester:
         return True
 
     def request(self, page):
-        with tracer.start_as_current_span('requester.request'):
+        self.name = threading.current_thread().name
+
+        with tracer.start_as_current_span('requester.request') as span:
+            span.set_attribute('page.url', self.url)
+            span.set_attribute('thread.name', self.name)
+            span.set_attribute('page.status_before', str(self.pager.page.status))
+            span.set_attribute(
+                'page.recursion_level', getattr(self.pager, 'page_recursion_level', 0)
+            )
+            span.set_attribute(
+                'domain.recursion_level', getattr(self.pager.domain, 'recursion_level', 0)
+            )
+            span.set_attribute('page.retry_count', self.pager.page.retry_count)
+
             start_timer_request = time.perf_counter()
             metric_requests_started.add(1, {'service': 'miner'})
             self._log_info('Mining')
 
             max_allowed_retries = self.settingsdb.get_config('max_retry_attempts')
             if self.pager.page.retry_count >= max_allowed_retries:
+                span.set_attribute('status', PageStatus.FAILED.value)
                 metric_requests_failed_max_retry.add(1, {'service': 'miner'})
                 self.pager.page.update(status=PageStatus.FAILED)
                 self._log_info(f'Too many retries. Status set to {PageStatus.FAILED}')
@@ -88,6 +103,7 @@ class Requester:
 
             max_recursion = self.settingsdb.get_config('max_recursion')
             if not self.has_more_recursion_limit(self.pager):
+                span.set_attribute('status', PageStatus.BLOCKED_LIMIT_RECURSION.value)
                 metric_requests_reached_recursion_limit.add(1, {'service': 'miner'})
                 self.pager.page.update(status=PageStatus.BLOCKED_LIMIT_RECURSION)
                 self._log_info(
@@ -98,16 +114,20 @@ class Requester:
 
             with tracer.start_as_current_span('requester.blocked_domain'):
                 if is_domain_blocked(self.url):
+                    span.set_attribute('status', PageStatus.DOMAIN_BLOCKED.value)
                     metric_requests_domain_blocked.add(1, {'service': 'miner'})
                     self.pager.page.update(status=PageStatus.DOMAIN_BLOCKED)
                     self._log_info('Halting: domain BLOCKED')
                     return
 
             if not self.pager.domain.try_register_request():
+                span.set_attribute('domain.is_in_cooldown', True)
                 metric_request_domain_in_cooldown.add(1, {'service': 'miner'})
                 self.pager.page.update(status=PageStatus.TODO)
                 self._log_info('Halting: domain in COOLDOWN')
                 return None
+            else:
+                span.set_attribute('domain.is_in_cooldown', False)
 
             self.pager.page.update(retry_count=self.pager.page.retry_count + 1)
 
@@ -116,8 +136,7 @@ class Requester:
                 return
 
             try:
-
-                with tracer.start_as_current_span('requester.page_goto'):
+                with tracer.start_as_current_span('requester.page_goto') as span_goto:
                     try:
                         metric_requests_made.add(1, {'service': 'miner'})
 
@@ -136,6 +155,7 @@ class Requester:
                         PlaywrightError,
                         TargetClosedError,
                     ) as e:
+                        span_goto.record_exception(e)
                         metric_requests_failed.add(1, {'service': 'miner'})
                         self.pager.page.update(status=PageStatus.TODO)
                         self._log_warning(f'page.goto failed: {type(e).__name__}')
@@ -153,6 +173,9 @@ class Requester:
                     final_url = page.url
                     status_code = response.status if response else None
 
+                    span_goto.set_attribute('http.response.status_code', status_code)
+                    span_goto.set_attribute('page.final_url', final_url)
+
                     if status_code is not None and status_code >= 400:
                         metric_requests_failed_status_code.add(1, {'service': 'miner'})
                         self.pager.page.update(status=PageStatus.TODO)
@@ -167,8 +190,7 @@ class Requester:
 
                 metric_pages_saved.add(1, {'service': 'miner'})
 
-                with tracer.start_as_current_span('requester.checking_lang'):
-                    is_desired_lang = detect_lang(text_content)
+                is_desired_lang = detect_lang(text_content)
 
                 self.pager.page.update(
                     url_final=final_url,
@@ -179,7 +201,9 @@ class Requester:
                     status=PageStatus.DONE if is_desired_lang else PageStatus.BLOCKED_LANGUAGE,
                 )
 
-                with tracer.start_as_current_span('requester.saving_hrefs'):
+                span.set_attribute('page.total_hrefs', len(hrefs))
+
+                with tracer.start_as_current_span('requester.saving_hrefs') as span_savinghrefs:
                     total_urls_saved = 0
                     start_timer_saving_hrefs = time.perf_counter()
                     for found_url in hrefs:
@@ -224,7 +248,7 @@ class Requester:
                                         'status': PageStatus.TODO.value,
                                     },
                                 )
-
+                    span_savinghrefs.set_attribute('total_saved', total_urls_saved)
 
                     metric_saving_found_hrefs_duration.record(
                         (time.perf_counter() - start_timer_saving_hrefs),
@@ -271,7 +295,7 @@ class Requester:
                 return None
 
             except Exception as e:
-                self.logger._log_error(f'Generic captured exception', extra={'exception': e})
+                self.logger._log_error('Generic captured exception', extra={'exception': e})
                 self.pager.page.update(status=PageStatus.FAILED)
                 return None
 

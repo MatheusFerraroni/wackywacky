@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 import pymysql
 from miner.settings.settings import settings
 
@@ -7,22 +8,42 @@ logger = logging.getLogger('db')
 _thread_local = threading.local()
 
 
-def _create_connection():
+def _create_connection(max_wait_seconds=150, retry_interval=2):
     logger.info(
         'Creating DB connection (host=%s, port=%s, db=%s)',
         settings.DB_HOST,
         settings.DB_PORT,
         settings.DB_NAME,
     )
-    return pymysql.connect(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-        database=settings.DB_NAME,
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+
+    deadline = time.monotonic() + max_wait_seconds
+    last_error = None
+
+    while time.monotonic() < deadline:
+        try:
+            conn = pymysql.connect(
+                host=settings.DB_HOST,
+                port=settings.DB_PORT,
+                user=settings.DB_USER,
+                password=settings.DB_PASSWORD,
+                database=settings.DB_NAME,
+                cursorclass=pymysql.cursors.DictCursor,
+                autocommit=True,
+            )
+            logger.info('DB connection established successfully')
+            return conn
+
+        except pymysql.MySQLError as exc:
+            last_error = exc
+            logger.warning(
+                'DB not ready yet. Retrying in %ss... (%s)',
+                retry_interval,
+                exc,
+            )
+            time.sleep(retry_interval)
+            retry_interval = max(10, retry_interval + 1)
+
+    raise RuntimeError(f'Could not connect to DB after {max_wait_seconds}s') from last_error
 
 
 def get_connection():

@@ -4,6 +4,7 @@ import signal
 import time
 from datetime import datetime
 import json
+import secrets
 from miner.db import get_connection, close_connection
 from miner.enums.system_status import SystemStatus
 from miner.starter.starter import Starter
@@ -12,11 +13,11 @@ from miner.models.page import Page
 from miner.requester import Requester
 from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
+from miner.leader import LeaderElection
 from opentelemetry import trace
 import threading
 from miner.enums import PageStatus
 from contextlib import suppress
-
 
 from miner.metrics import (
     metric_pages_released,
@@ -48,8 +49,10 @@ class App:
         self.last_log_threads = None
         self._last_threads_alive = 0
 
-        if reset_db:
-            self.reset_db()
+        self.leader = LeaderElection()
+        self._leader_checked = False
+
+        self.should_reset_db = reset_db
 
     def reset_db(self):
         self.logger.info('Cleaning DB started')
@@ -117,6 +120,8 @@ class App:
             return SystemStatus.ERROR
 
     def set_system_status(self, status):
+        if not self.leader or not self.leader.is_leader:
+            return
         with tracer.start_as_current_span('app.set_system_status'):
             if isinstance(status, SystemStatus):
                 normalized = status.value
@@ -143,16 +148,25 @@ class App:
             self._install_signal_handlers()
 
             try:
+                became_leader = self.leader.acquire(timeout_seconds=0)
+                if became_leader:
+                    self.logger.info('This instance is the global leader')
+                else:
+                    self.logger.info('This instance is a worker')
+
+                if self.should_reset_db and self.leader.is_leader:
+                    self.reset_db()
+
                 while self._running:
-                    should_clean_db = False
-                    if not self.last_clean_db:
-                        should_clean_db = True
-                    else:
+                    self.leader.refresh()
+                    should_clean_db = self.last_clean_db is None
+
+                    if not should_clean_db:
                         total_seconds = (datetime.now() - self.last_clean_db).total_seconds()
                         if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
                             should_clean_db = True
 
-                    if should_clean_db:
+                    if should_clean_db and self.leader.is_leader:
                         self.last_clean_db = datetime.now()
                         self.clean_db()
 
@@ -175,10 +189,14 @@ class App:
 
                     match self.system_status:
                         case SystemStatus.STARTING:
-                            self.logger.info('System is starting')
-                            self.init_starter()
+                            if self.leader.is_leader:
+                                self.logger.info('System is starting')
+                                self.init_starter()
+                            else:
+                                self.logger.info('Waiting for leader to run init_starter')
+                                time.sleep(1)
                         case SystemStatus.RUNNING_STARTER:
-                            self.logger.info('Waiting to start')
+                            self.logger.info('Waiting leader to finish init_starter')
                             time.sleep(1)  # just wait until it's ready to mine
                         case SystemStatus.RUNNING_MINING:
                             started = self.mine()
@@ -241,12 +259,19 @@ class App:
             start_timer = time.perf_counter()
             self.logger.info('Releasing stucked pages DB')
             total = Page.release_stucked_processing()
-            metric_pages_released.add(total, {'service': 'miner'})
+            metric_pages_released.add(total, {'service': 'miner', 'leader': self.leader.is_leader})
             span.set_attribute('db.pages_released', total)
             self.logger.info(f'Released {total} pages')
             metric_clean_db_duration.record(
-                (time.perf_counter() - start_timer), {'service': 'miner'}
+                (time.perf_counter() - start_timer),
+                {'service': 'miner', 'leader': self.leader.is_leader},
             )
+
+    def generate_worker_name(self):
+        self.worker_id += 1
+        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        hash6 = secrets.token_hex(3)
+        return f'miner-{self.worker_id}-{timestamp}-{hash6}'
 
     def mine(self) -> bool:
         started_any = False
@@ -265,9 +290,8 @@ class App:
                 return False
 
             for _ in range(available_slots):
-                self.worker_id += 1
                 time.sleep(random.random())  # random sleep to reduce concorrence at start
-                t = threading.Thread(target=self._mine, name=f'miner-worker-{self.worker_id}')
+                t = threading.Thread(target=self._mine, name=self.generate_worker_name())
                 t.start()
                 self.threads.append(t)
                 started_any = True
@@ -302,7 +326,8 @@ class App:
         page.route('**/*', route_handler)
 
     def _mine(self):
-        self.logger.info('Miner worker started')
+        thread_name = threading.current_thread().name
+        self.logger.info('Miner worker started | thread=%s', thread_name)
 
         page = None
         context = None
@@ -325,7 +350,6 @@ class App:
                 with tracer.start_as_current_span('app.mine') as span:
                     try:
                         while not self.shutdown_event.is_set():
-
                             url = None
 
                             while not self.shutdown_event.is_set():
@@ -359,7 +383,7 @@ class App:
                                 requester.request(page)
                                 metric_any_request_duration.record(
                                     (time.perf_counter() - start_timer),
-                                    {'service': 'miner'},
+                                    {'service': 'miner', 'leader': self.leader.is_leader},
                                 )
                     except Exception:
                         self.logger.exception('Unhandled exception in miner thread')

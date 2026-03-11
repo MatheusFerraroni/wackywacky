@@ -271,6 +271,10 @@ All collected data is stored in **MySQL**, including:
 
 ---
 
+# Disclaimer
+
+Generative AI was used to assist code writing in this project.
+
 # License
 
 See:
