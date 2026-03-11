@@ -246,32 +246,32 @@ class Requester:
 
             except (TargetClosedError, PlaywrightError):
                 if self.shutdown_event and self.shutdown_event.is_set():
-                    self._log_info('Playwright encerrado durante shutdown')
+                    self._log_warning('Playwright encerrado durante shutdown')
                     self.pager.page.update(status=PageStatus.TODO)
                     return None
 
-                self.logger.exception('Playwright falhou fora do shutdown')
-                self.pager.page.update(status=PageStatus.TODO)
-                return None
-
-            except KeyboardInterrupt:
-                self._log_info('Interrompido por sinal')
+                self.logger._log_warning('Playwright falhou fora do shutdown')
                 self.pager.page.update(status=PageStatus.TODO)
                 return None
 
             except AttributeError as e:
                 if '_playwright' in str(e):
                     if self.shutdown_event and self.shutdown_event.is_set():
-                        self._log_info('Playwright initialization interrupted during shutdown')
+                        self._log_warning('Playwright initialization interrupted during shutdown')
                         self.pager.page.update(status=PageStatus.TODO)
                         return None
-                    self.logger.exception('Playwright initialization failed')
+                    self.logger._log_warning('Playwright initialization failed')
                     self.pager.page.update(status=PageStatus.TODO)
                     return None
                 raise
 
+            except KeyboardInterrupt:
+                self._log_info('Interrompido por sinal')
+                self.pager.page.update(status=PageStatus.TODO)
+                return None
+
             except Exception as e:
-                self.logger.exception(f'Generic captured exception: {e}')
+                self.logger._log_error(f'Generic captured exception', extra={'exception': e})
                 self.pager.page.update(status=PageStatus.FAILED)
                 return None
 

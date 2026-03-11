@@ -50,5 +50,9 @@ class Settings:  # pylint: disable=too-few-public-methods
     MAX_THREADS = int(os.getenv('MAX_THREADS', '1'))
     SECONDS_BETWEEN_LOG_THREADS = 10
 
+    SAVE_HTML = os.getenv("SAVE_HTML", "False").lower() == "true"
+    MAX_CHARACTERS_TEXT = int(os.getenv('MAX_CHARACTERS_TEXT', '1000000'))
+
+
 
 settings = Settings()

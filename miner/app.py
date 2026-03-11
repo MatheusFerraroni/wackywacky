@@ -302,6 +302,7 @@ class App:
         page.route('**/*', route_handler)
 
     def _mine(self):
+        self.logger.info('Miner worker started')
 
         page = None
         context = None
@@ -324,20 +325,16 @@ class App:
                 with tracer.start_as_current_span('app.mine') as span:
                     try:
                         while not self.shutdown_event.is_set():
-                            self.logger.info('Miner started')
 
-                            claim_counter = 0
-                            claim_limit = 10
                             url = None
 
-                            while claim_counter < claim_limit and not self.shutdown_event.is_set():
-                                claim_counter += 1
+                            while not self.shutdown_event.is_set():
                                 with self.lock_claim_url:
                                     url = Page.claim_next_todo_url()
 
                                 if url is not None:
                                     break
-                                time.sleep(random.random() * 0.1)
+                                time.sleep(random.random() * 0.5)
 
                             if self.shutdown_event.is_set():
                                 return

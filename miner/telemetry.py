@@ -38,15 +38,6 @@ def _build_resource() -> Resource:
 
 
 def _normalize_endpoint(base_or_signal_endpoint: Optional[str], signal_path: str) -> str:
-    """
-    Aceita tanto endpoint completo quanto base OTLP.
-
-    Exemplos válidos de entrada:
-    - http://otel-collector:4318
-    - http://otel-collector:4318/
-    - http://otel-collector:4318/v1/traces
-    - http://otel-collector:4318/v1/logs
-    """
     if not base_or_signal_endpoint:
         raise ValueError(f'Missing OTLP endpoint for {signal_path}')
 
@@ -73,7 +64,6 @@ def setup_telemetry() -> None:
 
     resource = _build_resource()
 
-    # TRACE EXPORT
     traces_endpoint = _normalize_endpoint(
         getattr(Settings, 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', None),
         '/v1/traces',
@@ -84,7 +74,6 @@ def setup_telemetry() -> None:
     tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
     trace.set_tracer_provider(tracer_provider)
 
-    # METRICS EXPORT
     metrics_endpoint_setting = getattr(
         Settings,
         'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT',
@@ -103,10 +92,6 @@ def setup_telemetry() -> None:
     )
     metrics.set_meter_provider(meter_provider)
 
-    # LOG EXPORT
-    #
-    # Se você tiver Settings.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, ele será usado.
-    # Caso não tenha, reaproveita o endpoint de traces trocando para /v1/logs.
     logs_endpoint_setting = getattr(
         Settings,
         'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
@@ -119,7 +104,6 @@ def setup_telemetry() -> None:
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
     set_logger_provider(logger_provider)
 
-    # Encaminha logging padrão do Python para OTel
     otel_handler = LoggingHandler(
         level=logging.NOTSET,
         logger_provider=logger_provider,
@@ -128,17 +112,14 @@ def setup_telemetry() -> None:
     root_logger = logging.getLogger()
     root_logger.addHandler(otel_handler)
 
-    # Injeta trace_id/span_id no logging
     if not _logging_instrumented:
         LoggingInstrumentor().instrument(set_logging_format=True)
         _logging_instrumented = True
 
-    # Auto-instrumentation opcional
     if not _pymysql_instrumented:
         PyMySQLInstrumentor().instrument()
         _pymysql_instrumented = True
 
-    # Ative só se você realmente usa requests e quiser spans automáticos HTTP cliente
     if not _requests_instrumented:
         RequestsInstrumentor().instrument()
         _requests_instrumented = True

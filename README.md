@@ -18,6 +18,9 @@ The project also includes a complete **observability stack** for monitoring craw
 - Multi-threaded workers
 - Observability with metrics, logs, and traces
 - Multi-query crawler starter
+- Save compressed text and html data
+
+* By default, only the texts are saved to reduce the amount of generated data. Enable html saving in the settings.
 
 ---
 

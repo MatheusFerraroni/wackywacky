@@ -6,6 +6,7 @@ from miner.db import get_connection
 from miner.models.utils import md5_bin16, normalize_url
 from miner.enums.page_status import PageStatus
 from miner.settings.settings_db import SettingsDB
+from miner.settings.settings import settings
 from miner.metrics import metric_pages_marked_as_same_as
 import zstandard as zstd
 import threading
@@ -118,10 +119,14 @@ class Page:
         self.url_final_md5 = md5_bin16(self.url_final) if self.url_final else None
 
     def set_text(self, text: str | None) -> None:
-        self.text = text
-        self.text_md5 = md5_bin16(text) if text else None
+        if text is None:
+            return
+        self.text = text[:settings.MAX_CHARACTERS_TEXT]
+        self.text_md5 = md5_bin16(self.text) if self.text else None
 
     def set_html(self, html: str | None) -> None:
+        if not settings.SAVE_HTML:
+            return
         self.html = html
         self.html_md5 = md5_bin16(html) if html else None
 
@@ -381,13 +386,14 @@ class Page:
             self.title = title
 
         if text is not None:
+            text = text[:settings.MAX_CHARACTERS_TEXT]
             new_text_md5 = md5_bin16(text)
             sets.append('text = %s')
             params.append(_compress_str(text))
             sets.append('text_md5 = %s')
             params.append(new_text_md5)
 
-        if html is not None:
+        if html is not None and settings.SAVE_HTML:
             new_html_md5 = md5_bin16(html)
             sets.append('html = %s')
             params.append(_compress_str(html))
@@ -415,10 +421,10 @@ class Page:
             conn.commit()
 
             if text is not None:
-                self.text = text
+                self.text = text[:settings.MAX_CHARACTERS_TEXT]
                 self.text_md5 = new_text_md5
 
-            if html is not None:
+            if html is not None and settings.SAVE_HTML:
                 self.html = html
                 self.html_md5 = new_html_md5
 
@@ -514,7 +520,7 @@ class Page:
                 clauses.append('text_md5 = %s')
                 params.append(text_md5)
 
-            if html_md5 is not None:
+            if html_md5 is not None and settings.SAVE_HTML:
                 clauses.append('html_md5 = %s')
                 params.append(html_md5)
 
