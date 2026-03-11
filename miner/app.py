@@ -9,7 +9,6 @@ from miner.db import get_connection, close_connection
 from miner.enums.system_status import SystemStatus
 from miner.starter.starter import Starter
 from miner.pager.pager import Pager
-from miner.models.page import Page
 from miner.requester import Requester
 from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
@@ -18,6 +17,7 @@ from opentelemetry import trace
 import threading
 from miner.enums import PageStatus
 from contextlib import suppress
+from miner.models import Domain, Page
 
 from miner.metrics import (
     metric_pages_released,
@@ -249,8 +249,10 @@ class App:
             span.set_attribute('starter.init_urls.count', len(init_urls))
 
             for init_url in init_urls:
-                page = Pager(init_url)
-                page.save()
+                domain = Domain.get_or_create(init_url)
+                Page.get_or_create(domain_id=domain.id, url=init_url)
+                # page = Pager(init_url)
+                # page.save()
 
             self.set_system_status(SystemStatus.RUNNING_MINING)
 
@@ -374,19 +376,24 @@ class App:
 
                             if self.shutdown_event.is_set():
                                 pager.page.update(status=PageStatus.TODO)
+                                self.logger.info('Detected shutdown event')
                                 return
 
                             requester = Requester(shutdown_event=self.shutdown_event)
                             requester.prepare(pager)
                             with tracer.start_as_current_span('app.requesting'):
                                 start_timer = time.perf_counter()
-                                requester.request(page)
+                                try:
+                                    requester.request(page)
+                                except Exception:
+                                    self.logger.exception('Unhandled exception inside requester')
                                 metric_any_request_duration.record(
                                     (time.perf_counter() - start_timer),
                                     {'service': 'miner', 'leader': self.leader.is_leader},
                                 )
-                    except Exception:
+                    except Exception as e:
                         self.logger.exception('Unhandled exception in miner thread')
+                        raise e
 
         finally:
             if page is not None:

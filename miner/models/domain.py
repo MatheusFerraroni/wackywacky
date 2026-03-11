@@ -46,7 +46,7 @@ class Domain:
             return cls(**row) if row else None
 
     @classmethod
-    def get_or_create(cls, any_url: str, parent_pager) -> 'Domain':
+    def get_or_create(cls, any_url: str, parent_pager=None) -> 'Domain':
 
         dom = extract_hostname(any_url)
         dom_md5 = md5_bin16(dom)
@@ -55,7 +55,7 @@ class Domain:
         if existing:
             return existing
 
-        recursion_level = parent_pager.domain.recursion_level if parent_pager is not None else 0
+        recursion_level = parent_pager.domain.recursion_level + 1 if parent_pager is not None else 0
         parent_id = parent_pager.domain.id if parent_pager is not None else None
 
         conn = get_connection()
@@ -147,3 +147,53 @@ class Domain:
         except Exception:
             conn.rollback()
             raise
+
+    @classmethod
+    def extract_hostname(cls, url):
+        return extract_hostname(url)
+
+    @classmethod
+    def bulk_get_or_create(cls, urls: list[str], parent_domain) -> dict[str, 'Domain']:
+        conn = get_connection()
+
+        extracted_hosts = [extract_hostname(url) for url in urls]
+        hosts = list({host for host in extracted_hosts if host})
+
+        if not hosts:
+            return {}
+
+        rows = []
+        for host in hosts:
+            rows.append(
+                (
+                    host,
+                    md5_bin16(host),
+                    parent_domain.recursion_level + 1 if parent_domain is not None else 0,
+                    parent_domain.id if parent_domain is not None else None,
+                )
+            )
+
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT IGNORE INTO domain (url, url_md5, recursion_level, parent_domain_id)
+                VALUES (%s, %s, %s, %s)
+                """,
+                rows,
+            )
+
+            format_strings = ','.join(['%s'] * len(hosts))
+            cur.execute(
+                f"""
+                SELECT
+                    id, url, url_md5, parent_domain_id, recursion_level,
+                    request_count, last_request_at, created_at, updated_at
+                FROM domain
+                WHERE url IN ({format_strings})
+                """,
+                hosts,
+            )
+            result = cur.fetchall()
+
+        conn.commit()
+        return {row['url']: cls(**row) for row in result}

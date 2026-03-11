@@ -99,18 +99,27 @@ services:
       - ./prometheus_data:/prometheus
     restart: unless-stopped
 
-  # worker:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   environment:
-  #     DB_HOST: mysql
-  #     DB_PORT: "3306"
-  #     DB_NAME: appdb
-  #     DB_USER: appuser
-  #     DB_PASSWORD: apppass
-  #     DATABASE_URL: "mysql+pymysql://appuser:apppass@mysql:3306/appdb"
-  #   depends_on:
-  #     mysql:
-  #       condition: service_healthy
-  #   restart: unless-stopped
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: appdb
+      DB_USER: appuser
+      DB_PASSWORD: apppass
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318
+      MAX_THREADS: 5
+      DATABASE_URL: mysql+pymysql://appuser:apppass@mysql:3306/appdb
+      OTEL_SERVICE_NAME: miner
+      OTEL_SERVICE_VERSION: 1.0.0
+      OTEL_ENV: dev
+      SAVE_HTML: False
+      MAX_CHARACTERS_TEXT: 1000000
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped

@@ -30,7 +30,6 @@ def _decompress_str(value: bytes | None) -> str | None:
     return _zstd_decompressor.decompress(value).decode('utf-8')
 
 
-# TODO: compression with zstd
 @dataclass
 class Page:
     id: int | None
@@ -322,7 +321,7 @@ class Page:
                     )
 
                 conn.commit()
-            return row['url']
+            return row['id']
 
         except Exception:
             conn.rollback()
@@ -550,3 +549,50 @@ class Page:
             cur.execute(sql, params)
             row = cur.fetchone()
             return int(row['id']) if row else None
+
+    @classmethod
+    def bulk_insert_ignore(cls, rows: list[dict]) -> int:
+        #
+        if not rows:
+            return 0
+
+        conn = get_connection()
+        BATCH_SIZE = 500
+
+        sql = """
+            INSERT IGNORE INTO pages (
+                domain_id,
+                parent_page_id,
+                same_as,
+                url,
+                url_md5,
+                recursion_level,
+                status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+
+        total_affected = 0
+
+        with conn.cursor() as cur:
+            for i in range(0, len(rows), BATCH_SIZE):
+                batch = rows[i : i + BATCH_SIZE]
+
+                values = [
+                    (
+                        row['domain_id'],
+                        row['parent_page_id'],
+                        row['same_as'],
+                        normalize_url(row['url']),
+                        row['url_md5'],
+                        row['recursion_level'],
+                        row['status'],
+                    )
+                    for row in batch
+                ]
+
+                cur.executemany(sql, values)
+                total_affected += cur.rowcount
+
+        conn.commit()
+        return total_affected

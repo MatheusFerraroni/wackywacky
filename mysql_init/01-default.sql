@@ -50,6 +50,7 @@ CREATE TABLE `pages` (
     'processing',
     'done',
     'failed',
+    'failed_timeout',
     'blocked_domain',
     'blocked_limit_recursion',
     'blocked_language'
