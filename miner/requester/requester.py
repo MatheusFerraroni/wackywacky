@@ -42,6 +42,35 @@ class Requester:
         self.request_timeout_ms = self.settingsdb.get_config('request_timeout_ms')
         self.shutdown_event = shutdown_event
 
+        self.timer = {}
+
+    def start_timer(self, name, count_towards_total):
+        # Overlapping timers should use count_towards_total=False
+        if name in self.timer:
+            raise Exception(f'Using repeated timer: {name}')
+
+        self.timer[name] = {
+            'start': time.perf_counter(),
+            'count_towards_total': count_towards_total,
+            'end': 0,
+            'duration': 0,
+            'completed': False,
+        }
+
+    def end_timer(self, name):
+        if name not in self.timer:
+            raise Exception('Using not existent timer')
+
+        self.timer[name]['end'] = time.perf_counter()
+        self.timer[name]['duration'] = self.timer[name]['end'] - self.timer[name]['start']
+        self.timer[name]['completed'] = True
+
+    def get_timer_duration(self, name):
+        if self.timer[name]['completed']:
+            return self.timer[name]['duration']
+
+        raise Exception(f'Timer {name} not completed')
+
     def prepare(self, pager):
         self.pager = pager
         self.url = self.pager.url
@@ -114,11 +143,59 @@ class Requester:
 
         return True
 
-    def request(self, page_playwright):
-        self._log_info('Mining started')
-        start_timer_request = time.perf_counter()
+    def logging_timers(self, total_duration):
+        total_measured = 0
 
-        start_pre_goto = time.perf_counter()
+        values_to_log = [('Total', total_duration)]
+
+        for name, item in self.timer.items():
+            print(
+                name,
+                item,
+                item['count_towards_total'],
+                item['completed'],
+                item['count_towards_total'] and item['completed'],
+            )
+            if item['count_towards_total'] and item['completed']:
+                total_measured += item['duration']
+
+            x = 'T' if item['count_towards_total'] else 'F'
+
+            if item['completed']:
+                values_to_log.append((name + f' ({x})', item['duration']))
+            else:
+                values_to_log.append((name + f' ({x})', None))
+
+        missing = total_duration - total_measured
+        values_to_log.append(('Missing', missing))
+
+        log_parts = []
+        for name, value in values_to_log:
+            if value is None:
+                log_parts.append(f'{name}: None')
+            else:
+                log_parts.append(f'{name}: {value:.1f}s')
+
+        self.logger.success('Timers: ' + ' | '.join(log_parts))
+
+    def request(self, page_playwright):
+        ret = None
+        try:
+            start_timer = time.perf_counter()
+            ret = self._request(page_playwright)
+            duration = time.perf_counter() - start_timer
+
+            self.logging_timers(duration)
+        except Exception as e:
+            self.error(f'Uncaught exception: {str(e)}')
+        finally:
+            return ret
+
+    def _request(self, page_playwright):
+        self.start_timer('request.begin', count_towards_total=False)
+        self.start_timer('before.goto', count_towards_total=True)
+        self._log_info('Mining started')
+
         self.name = threading.current_thread().name
 
         with tracer.start_as_current_span('requester.request') as span:
@@ -167,22 +244,23 @@ class Requester:
                 return
 
             self.pager.page.update(retry_count=self.pager.page.retry_count + 1)
-            duration_pre_goto = time.perf_counter() - start_pre_goto
+            self.end_timer('before.goto')
+            self.start_timer('goto.block', count_towards_total=True)
 
             try:
                 try:
                     metric_requests_made.add(1, {'service': 'miner'})
 
-                    start_timer_page_goto = time.perf_counter()
+                    self.start_timer('goto.only', count_towards_total=False)
                     response = page_playwright.goto(
                         self.url,
                         wait_until='domcontentloaded',
                         timeout=self.request_timeout_ms,
                     )
+                    self.end_timer('goto.only')
 
-                    duration_goto_load = time.perf_counter() - start_timer_page_goto
                     metric_page_goto_duration.record(
-                        duration_goto_load,
+                        self.get_timer_duration('goto.only'),
                         {'service': 'miner'},
                     )
 
@@ -225,6 +303,9 @@ class Requester:
                     )
                     return
 
+                self.end_timer('goto.block')
+                self.start_timer('goto.processing', count_towards_total=True)
+
                 final_url = page_playwright.url
                 status_code = response.status if response else None
 
@@ -246,13 +327,15 @@ class Requester:
 
                 metric_pages_saved.add(1, {'service': 'miner'})
 
-                start_detect_lang = time.perf_counter()
+                self.start_timer('detect_lang', count_towards_total=False)
                 is_desired_lang = detect_lang(text_content)
-                duration_detect_lang = time.perf_counter() - start_detect_lang
+                self.end_timer('detect_lang')
 
                 new_status = PageStatus.DONE if is_desired_lang else PageStatus.BLOCKED_LANGUAGE
 
-                start_update_mined_page_update = time.perf_counter()
+                self.end_timer('goto.processing')
+                self.start_timer('page.save_results', count_towards_total=True)
+
                 self.pager.page.update(
                     url_final=final_url,
                     status_code=status_code,
@@ -261,20 +344,17 @@ class Requester:
                     html=html_content,
                     status=new_status,
                 )
+                self.end_timer('page.save_results')
 
-                duration_update_mined_page_update = (
-                    time.perf_counter() - start_update_mined_page_update
-                )
-
-                start_create_domains = time.perf_counter()
+                self.start_timer('domain.bulk_save', count_towards_total=True)
                 domains_created = Domain.bulk_get_or_create(hrefs, self.pager.domain)
-                duration_create_domains = time.perf_counter() - start_create_domains
+                self.end_timer('domain.bulk_save')
+
+                self.start_timer('pages.processing', count_towards_total=True)
 
                 span.set_attribute('page.total_hrefs', len(hrefs))
 
                 total_urls_saved = 0
-                start_timer_saving_hrefs = time.perf_counter()
-
                 pages_to_insert = []
                 status_counter = Counter()
 
@@ -317,7 +397,9 @@ class Requester:
                         }
                     )
                     status_counter[status.value] += 1
+                self.start_timer('pages.bulk_save', count_towards_total=False)
                 total_urls_saved = Page.bulk_insert_ignore(pages_to_insert)
+                self.end_timer('pages.bulk_save')
 
                 for status, count in status_counter.items():
                     metric_pages_saved_with_status.add(
@@ -328,50 +410,20 @@ class Requester:
                         },
                     )
 
-                duration_saving_hrefs = time.perf_counter() - start_timer_saving_hrefs
+                self.end_timer('pages.processing')
 
                 metric_saving_found_hrefs_duration.record(
-                    duration_saving_hrefs,
+                    self.get_timer_duration('pages.processing'),
                     {'service': 'miner'},
                 )
 
                 self._log_info(f'Saved {total_urls_saved} new URLs')
                 span.set_status(Status(StatusCode.OK))
 
-                duration_entire_method = time.perf_counter() - start_timer_request
+                self.end_timer('request.begin')
                 metric_request_duration.record(
-                    duration_entire_method,
+                    self.get_timer_duration('request.begin'),
                     {'service': 'miner'},
-                )
-
-                missing = (
-                    duration_entire_method
-                    - duration_saving_hrefs
-                    - duration_goto_load
-                    - duration_detect_lang
-                    - duration_update_mined_page_update
-                    - duration_pre_goto
-                    - duration_create_domains
-                )
-
-                pct_saving = (duration_saving_hrefs / duration_entire_method) * 100
-                pct_goto = (duration_goto_load / duration_entire_method) * 100
-                pct_lang = (duration_detect_lang / duration_entire_method) * 100
-                pct_update = (duration_update_mined_page_update / duration_entire_method) * 100
-                pct_duration_pre_goto = (duration_pre_goto / duration_entire_method) * 100
-                pct_create_domains = (duration_create_domains / duration_entire_method) * 100
-                pct_missing = (missing / duration_entire_method) * 100
-
-                self.logger.success(
-                    'Complete mined URL! | '
-                    f'Total: {duration_entire_method:.3f}s | '
-                    f'HREFs: {pct_saving:.1f}% | '
-                    f'Goto: {pct_goto:.1f}% | '
-                    f'Lang: {pct_lang:.1f}% | '
-                    f'Update: {pct_update:.1f}% | '
-                    f'pregoto: {pct_duration_pre_goto:.1f}% | '
-                    f'domains: {pct_create_domains:.1f}% | '
-                    f'Missing: {pct_missing:.1f}%'
                 )
 
                 return True

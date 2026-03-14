@@ -351,6 +351,7 @@ class Page:
         except Exception:
             conn.rollback()
             raise
+
     def update(
         self,
         status: PageStatus | str | None = None,
@@ -589,12 +590,12 @@ class Page:
         prepared_rows: list[tuple] = []
 
         for row in rows:
-            key = (row["domain_id"], row["url_md5"])
+            key = (row['domain_id'], row['url_md5'])
             if key in seen:
                 continue
             seen.add(key)
 
-            url = row["url"]
+            url = row['url']
             normalized_url = norm_cache.get(url)
             if normalized_url is None:
                 normalized_url = normalize_url(url)
@@ -602,13 +603,13 @@ class Page:
 
             prepared_rows.append(
                 (
-                    row["domain_id"],
-                    row["parent_page_id"],
-                    row["same_as"],
+                    row['domain_id'],
+                    row['parent_page_id'],
+                    row['same_as'],
                     normalized_url,
-                    row["url_md5"],
-                    row["recursion_level"],
-                    row["status"],
+                    row['url_md5'],
+                    row['recursion_level'],
+                    row['status'],
                 )
             )
 
@@ -632,7 +633,7 @@ class Page:
             for i in range(0, len(prepared_rows), batch_size):
                 batch = prepared_rows[i : i + batch_size]
 
-                values_sql = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(batch))
+                values_sql = ', '.join(['(%s, %s, %s, %s, %s, %s, %s)'] * len(batch))
                 sql = base_sql.format(values_sql=values_sql)
 
                 params = []
