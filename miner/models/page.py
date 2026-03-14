@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+import random
 import pymysql
 
 from miner.db import get_connection
@@ -241,11 +242,9 @@ class Page:
 
     @classmethod
     def claim_next_todo_url(cls) -> str | None:
-        # prevent too many fast requests for the same domain
         domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
         domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
 
-        # allow to retry failed pages after a while
         retry_interval_ms = SettingsDB().get_config('retry_interval_ms')
         retry_interval_seconds = int(retry_interval_ms / 1000)
 
@@ -259,30 +258,52 @@ class Page:
                 with lock_claim_next:
                     cur.execute(
                         """
-                        SELECT
-                            p.id,
-                            p.url,
-                            d.id as domain_id
-                        FROM pages p
-                        INNER JOIN domain d
-                            ON d.id = p.domain_id
-                        WHERE
-                            p.recursion_level < %s
-                            AND d.recursion_level < %s
-                            AND p.retry_count < %s
-                            AND (
-                                d.last_request_at IS NULL
-                                OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                        SELECT *
+                        FROM (
+                            (
+                                SELECT
+                                    p.id,
+                                    p.url,
+                                    d.id AS domain_id
+                                FROM pages p
+                                INNER JOIN domain d
+                                    ON d.id = p.domain_id
+                                WHERE
+                                    p.recursion_level < %s
+                                    AND d.recursion_level < %s
+                                    AND p.retry_count < %s
+                                    AND (
+                                        d.last_request_at IS NULL
+                                        OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                    )
+                                    AND p.status = %s
+                                LIMIT 20
+                                FOR UPDATE SKIP LOCKED
                             )
-                            AND p.status IN (%s, %s)
-                            AND (
-                                p.status = %s
-                                OR p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                            UNION ALL
+                            (
+                                SELECT
+                                    p.id,
+                                    p.url,
+                                    d.id AS domain_id
+                                FROM pages p
+                                INNER JOIN domain d
+                                    ON d.id = p.domain_id
+                                WHERE
+                                    p.recursion_level < %s
+                                    AND d.recursion_level < %s
+                                    AND p.retry_count < %s
+                                    AND (
+                                        d.last_request_at IS NULL
+                                        OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                    )
+                                    AND p.status = %s
+                                    AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                LIMIT 20
+                                FOR UPDATE SKIP LOCKED
                             )
-                        ORDER BY
-                            (p.status != %s) DESC,
-                            RAND()
-                        FOR UPDATE SKIP LOCKED
+                        ) AS candidates
+                        LIMIT 20
                         """,
                         [
                             max_recursion_page,
@@ -290,17 +311,21 @@ class Page:
                             max_retry_attempts,
                             domain_cooldown_seconds,
                             PageStatus.TODO.value,
+                            max_recursion_page,
+                            max_recursion,
+                            max_retry_attempts,
+                            domain_cooldown_seconds,
                             PageStatus.FAILED.value,
-                            PageStatus.TODO.value,
                             retry_interval_seconds,
-                            PageStatus.TODO.value,
                         ],
                     )
-                    row = cur.fetchone()
+                    rows = cur.fetchall()
 
-                    if not row:
+                    if not rows:
                         conn.rollback()
                         return None
+
+                    row = random.choice(rows)
 
                     cur.execute(
                         """
@@ -317,7 +342,7 @@ class Page:
                         SET updated_at = CURRENT_TIMESTAMP
                         WHERE id = %s
                         """,
-                        (row['domain_id']),
+                        (row['domain_id'],),
                     )
 
                 conn.commit()
@@ -326,7 +351,6 @@ class Page:
         except Exception:
             conn.rollback()
             raise
-
     def update(
         self,
         status: PageStatus | str | None = None,
@@ -552,14 +576,46 @@ class Page:
 
     @classmethod
     def bulk_insert_ignore(cls, rows: list[dict]) -> int:
-        #
         if not rows:
             return 0
 
         conn = get_connection()
-        BATCH_SIZE = 500
+        batch_size = 1000
+        total_affected = 0
 
-        sql = """
+        norm_cache: dict[str, str] = {}
+
+        seen: set[tuple[int, str]] = set()
+        prepared_rows: list[tuple] = []
+
+        for row in rows:
+            key = (row["domain_id"], row["url_md5"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            url = row["url"]
+            normalized_url = norm_cache.get(url)
+            if normalized_url is None:
+                normalized_url = normalize_url(url)
+                norm_cache[url] = normalized_url
+
+            prepared_rows.append(
+                (
+                    row["domain_id"],
+                    row["parent_page_id"],
+                    row["same_as"],
+                    normalized_url,
+                    row["url_md5"],
+                    row["recursion_level"],
+                    row["status"],
+                )
+            )
+
+        if not prepared_rows:
+            return 0
+
+        base_sql = """
             INSERT IGNORE INTO pages (
                 domain_id,
                 parent_page_id,
@@ -569,29 +625,21 @@ class Page:
                 recursion_level,
                 status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES {values_sql}
         """
 
-        total_affected = 0
-
         with conn.cursor() as cur:
-            for i in range(0, len(rows), BATCH_SIZE):
-                batch = rows[i : i + BATCH_SIZE]
+            for i in range(0, len(prepared_rows), batch_size):
+                batch = prepared_rows[i : i + batch_size]
 
-                values = [
-                    (
-                        row['domain_id'],
-                        row['parent_page_id'],
-                        row['same_as'],
-                        normalize_url(row['url']),
-                        row['url_md5'],
-                        row['recursion_level'],
-                        row['status'],
-                    )
-                    for row in batch
-                ]
+                values_sql = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(batch))
+                sql = base_sql.format(values_sql=values_sql)
 
-                cur.executemany(sql, values)
+                params = []
+                for item in batch:
+                    params.extend(item)
+
+                cur.execute(sql, params)
                 total_affected += cur.rowcount
 
         conn.commit()

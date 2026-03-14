@@ -12,6 +12,12 @@ services:
     volumes:
       - ./mysql_data:/var/lib/mysql
       - ./mysql_init:/docker-entrypoint-initdb.d:ro
+      - ./mysql_logs:/var/log/mysql
+    command:
+      - --slow_query_log=1
+      - --slow_query_log_file=/var/log/mysql/slow.log
+      - --long_query_time=0.5
+      - --log_queries_not_using_indexes=0
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-prootpass"]
       interval: 10s

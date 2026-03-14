@@ -20,5 +20,6 @@ resource_output/
 prometheus_data/
 otel_data/
 mysql_data/
+mysql_logs/
 jaeger_data/
 .env.example

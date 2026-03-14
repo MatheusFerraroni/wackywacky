@@ -16,8 +16,12 @@ CREATE TABLE `domain` (
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
   UNIQUE KEY `uq_domain_url_md5` (`url_md5`),
+
+  KEY `idx_domain_recursion_level` (`recursion_level`),
   KEY `idx_domain_last_request_at` (`last_request_at`),
   KEY `idx_domain_parent_domain_id` (`parent_domain_id`),
+
+  KEY `idx_domain_worker` (`recursion_level`, `last_request_at`, `id`),
 
   CONSTRAINT `fk_domain_parent`
     FOREIGN KEY (`parent_domain_id`)
@@ -79,7 +83,12 @@ CREATE TABLE `pages` (
   KEY `idx_pages_status_created_at` (`status`, `created_at`),
   KEY `idx_pages_status_updated_at` (`status`, `updated_at`),
 
+  KEY `idx_pages_retry_count` (`retry_count`),
+  KEY `idx_pages_updated_at` (`updated_at`),
+
   KEY `idx_pages_url_final_md5` (`url_final_md5`),
+
+  KEY `idx_pages_worker` (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`),
 
   CONSTRAINT `fk_pages_domain`
     FOREIGN KEY (`domain_id`) REFERENCES `domain` (`id`)

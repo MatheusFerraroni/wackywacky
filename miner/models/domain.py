@@ -173,6 +173,8 @@ class Domain:
                 )
             )
 
+        md5s = list(map(lambda x: x[1], rows))
+
         with conn.cursor() as cur:
             cur.executemany(
                 """
@@ -189,9 +191,9 @@ class Domain:
                     id, url, url_md5, parent_domain_id, recursion_level,
                     request_count, last_request_at, created_at, updated_at
                 FROM domain
-                WHERE url IN ({format_strings})
+                WHERE url_md5 IN ({format_strings})
                 """,
-                hosts,
+                md5s,
             )
             result = cur.fetchall()
 
