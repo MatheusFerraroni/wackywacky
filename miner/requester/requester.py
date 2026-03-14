@@ -11,6 +11,7 @@ import threading
 from collections import Counter
 from miner.models.utils import md5_bin16
 from miner.models import Page, Domain
+from opentelemetry.trace.status import Status, StatusCode
 
 
 from miner.metrics import (
@@ -34,7 +35,7 @@ tracer = trace.get_tracer(__name__)
 
 
 class Requester:
-    def __init__(self, shutdown_event=None):
+    def __init__(self, shutdown_event):
         self.settingsdb = SettingsDB()
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -68,6 +69,27 @@ class Requester:
     def _log_success(self, message, **extra):
         self.logger.success('%s | context=%s', message, self._log_context(**extra))
 
+    def _halt(self, span, page_status=None, reason='', outcome='halted', exc=None, level='info'):
+        if exc is not None:
+            self.logger.exception(exc)
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR))
+
+        span.set_attribute('request.outcome', outcome)
+        span.set_attribute('halt.reason', reason)
+
+        if page_status is not None:
+            span.set_attribute('page.status_after', page_status.value)
+            self.pager.page.update(status=page_status)
+
+        log_fn = {
+            'info': self._log_info,
+            'warning': self._log_warning,
+            'error': self._log_error,
+        }[level]
+        log_fn(f'Halting: {reason}')
+        return None
+
     def has_more_recursion_limit(self, pager):
         max_recursion = self.settingsdb.get_config('max_recursion')
         max_recursion_page = self.settingsdb.get_config('max_recursion_page')
@@ -93,12 +115,15 @@ class Requester:
         return True
 
     def request(self, page_playwright):
+        self._log_info('Mining started')
         start_timer_request = time.perf_counter()
 
         start_pre_goto = time.perf_counter()
         self.name = threading.current_thread().name
 
         with tracer.start_as_current_span('requester.request') as span:
+            span.set_attribute('page.page_id', self.pager.page.id)
+            span.set_attribute('domain.domain_id', self.pager.domain.id)
             span.set_attribute('page.url', self.url)
             span.set_attribute('thread.name', self.name)
             span.set_attribute('page.status_before', str(self.pager.page.status))
@@ -111,122 +136,121 @@ class Requester:
             span.set_attribute('page.retry_count', self.pager.page.retry_count)
 
             metric_requests_started.add(1, {'service': 'miner'})
-            self._log_info('Mining')
 
             max_allowed_retries = self.settingsdb.get_config('max_retry_attempts')
             if self.pager.page.retry_count >= max_allowed_retries:
-                span.set_attribute('status', PageStatus.FAILED.value)
+                self._halt(span, page_status=PageStatus.FAILED, reason='max_retry_attempts')
                 metric_requests_failed_max_retry.add(1, {'service': 'miner'})
-                self.pager.page.update(status=PageStatus.FAILED)
-                self._log_info(f'Halting: Too many retries. Status set to {PageStatus.FAILED}')
                 return
 
-            max_recursion = self.settingsdb.get_config('max_recursion')
             if not self.has_more_recursion_limit(self.pager):
-                span.set_attribute('status', PageStatus.BLOCKED_LIMIT_RECURSION.value)
-                metric_requests_reached_recursion_limit.add(1, {'service': 'miner'})
-                self.pager.page.update(status=PageStatus.BLOCKED_LIMIT_RECURSION)
-                self._log_info(
-                    f'Halting: Max recursion reached. Status set to {PageStatus.BLOCKED_LIMIT_RECURSION.value}',
-                    extra={'max_recursion': max_recursion},
+                self._halt(
+                    span, page_status=PageStatus.BLOCKED_LIMIT_RECURSION, reason='max_recursion'
                 )
+                metric_requests_reached_recursion_limit.add(1, {'service': 'miner'})
                 return
 
-            with tracer.start_as_current_span('requester.blocked_domain'):
-                if is_domain_blocked(self.url):
-                    span.set_attribute('status', PageStatus.DOMAIN_BLOCKED.value)
-                    metric_requests_domain_blocked.add(1, {'service': 'miner'})
-                    self.pager.page.update(status=PageStatus.DOMAIN_BLOCKED)
-                    self._log_info('Halting: domain BLOCKED')
-                    return
+            if is_domain_blocked(self.url):
+                metric_requests_domain_blocked.add(1, {'service': 'miner'})
+                self._halt(span, page_status=PageStatus.DOMAIN_BLOCKED, reason='domain_blocked')
+                return
 
             if not self.pager.domain.try_register_request():
-                span.set_attribute('domain.is_in_cooldown', True)
+                self._halt(span, page_status=PageStatus.TODO, reason='domain_cooldown')
                 metric_request_domain_in_cooldown.add(1, {'service': 'miner'})
-                self.pager.page.update(status=PageStatus.TODO)
-                self._log_info('Halting: domain in COOLDOWN')
                 return None
             else:
                 span.set_attribute('domain.is_in_cooldown', False)
 
-            self.pager.page.update(retry_count=self.pager.page.retry_count + 1)
-
             if self.shutdown_event.is_set():
-                self.pager.page.update(status=PageStatus.TODO)
-                self._log_info('Halting: Shutdown event detected')
+                self._halt(span, page_status=PageStatus.TODO, reason='shutdown event')
                 return
 
+            self.pager.page.update(retry_count=self.pager.page.retry_count + 1)
             duration_pre_goto = time.perf_counter() - start_pre_goto
 
             try:
-                with tracer.start_as_current_span('requester.page_goto') as span_goto:
-                    try:
-                        metric_requests_made.add(1, {'service': 'miner'})
+                try:
+                    metric_requests_made.add(1, {'service': 'miner'})
 
-                        start_timer_page_goto = time.perf_counter()
-                        response = page_playwright.goto(
-                            self.url,
-                            wait_until='domcontentloaded',
-                            timeout=self.request_timeout_ms,
-                        )
+                    start_timer_page_goto = time.perf_counter()
+                    response = page_playwright.goto(
+                        self.url,
+                        wait_until='domcontentloaded',
+                        timeout=self.request_timeout_ms,
+                    )
 
-                        duration_goto_load = time.perf_counter() - start_timer_page_goto
-                        metric_page_goto_duration.record(
-                            duration_goto_load,
-                            {'service': 'miner'},
-                        )
+                    duration_goto_load = time.perf_counter() - start_timer_page_goto
+                    metric_page_goto_duration.record(
+                        duration_goto_load,
+                        {'service': 'miner'},
+                    )
 
-                    except PlaywrightTimeout as e:
-                        span_goto.record_exception(e)
-                        metric_requests_failed.add(1, {'service': 'miner'})
-                        self.pager.page.update(status=PageStatus.FAILED_TIMEOUT)
-                        self._log_warning(f'Halting: page.goto failed: {PageStatus.FAILED_TIMEOUT}')
-                        return
-                    except (
-                        PlaywrightError,
-                        TargetClosedError,
-                    ) as e:
-                        span_goto.record_exception(e)
-                        metric_requests_failed.add(1, {'service': 'miner'})
-                        self.pager.page.update(status=PageStatus.TODO)
-                        self._log_warning(f'Halting: page.goto failed: {type(e).__name__}')
-                        return
+                except PlaywrightTimeout:
+                    metric_requests_failed.add(1, {'service': 'miner'})
+                    self._halt(
+                        span,
+                        page_status=PageStatus.FAILED_TIMEOUT,
+                        reason='PlaywrightTimeout',
+                        level='warning',
+                    )
+                    return
+                except (
+                    PlaywrightError,
+                    TargetClosedError,
+                ):
+                    self._halt(
+                        span,
+                        page_status=PageStatus.TODO,
+                        reason='Playwright error',
+                        level='warning',
+                    )
+                    metric_requests_failed.add(1, {'service': 'miner'})
+                    return
 
+                try:
                     page_playwright.wait_for_selector(
                         'body', timeout=int(self.request_timeout_ms / 2)
                     )
 
-                    try:
-                        page_playwright.wait_for_load_state(
-                            'networkidle', timeout=int(self.request_timeout_ms / 3)
-                        )
-                    except PlaywrightTimeout:
-                        pass
+                    page_playwright.wait_for_load_state(
+                        'networkidle', timeout=int(self.request_timeout_ms / 3)
+                    )
+                except PlaywrightTimeout:
+                    self._halt(
+                        span,
+                        page_status=PageStatus.TODO,
+                        reason='PlaywrightTimeout2',
+                        level='warning',
+                    )
+                    return
 
-                    final_url = page_playwright.url
-                    status_code = response.status if response else None
+                final_url = page_playwright.url
+                status_code = response.status if response else None
 
-                    span_goto.set_attribute('http.response.status_code', status_code)
-                    span_goto.set_attribute('page.final_url', final_url)
+                if status_code is not None and status_code >= 400:
+                    metric_requests_failed_status_code.add(1, {'service': 'miner'})
+                    self._halt(
+                        span,
+                        page_status=PageStatus.TODO,
+                        reason=f'wrong http status code {status_code}',
+                    )
+                    return None
 
-                    if status_code is not None and status_code >= 400:
-                        metric_requests_failed_status_code.add(1, {'service': 'miner'})
-                        self.pager.page.update(status=PageStatus.TODO)
-                        self._log_info('Halting: wrong http status code')
-                        return None
+                text_content = page_playwright.locator('body').inner_text()
+                html_content = page_playwright.content()
+                title = page_playwright.title()
 
-                    text_content = page_playwright.locator('body').inner_text()
-                    html_content = page_playwright.content()
-                    title = page_playwright.title()
-
-                    anchors = page_playwright.locator('a[href]')
-                    hrefs = anchors.evaluate_all('elements => elements.map(e => e.href)')
+                anchors = page_playwright.locator('a[href]')
+                hrefs = anchors.evaluate_all('elements => elements.map(e => e.href)')
 
                 metric_pages_saved.add(1, {'service': 'miner'})
 
                 start_detect_lang = time.perf_counter()
                 is_desired_lang = detect_lang(text_content)
                 duration_detect_lang = time.perf_counter() - start_detect_lang
+
+                new_status = PageStatus.DONE if is_desired_lang else PageStatus.BLOCKED_LANGUAGE
 
                 start_update_mined_page_update = time.perf_counter()
                 self.pager.page.update(
@@ -235,8 +259,9 @@ class Requester:
                     title=title,
                     text=text_content,
                     html=html_content,
-                    status=PageStatus.DONE if is_desired_lang else PageStatus.BLOCKED_LANGUAGE,
+                    status=new_status,
                 )
+
                 duration_update_mined_page_update = (
                     time.perf_counter() - start_update_mined_page_update
                 )
@@ -247,68 +272,71 @@ class Requester:
 
                 span.set_attribute('page.total_hrefs', len(hrefs))
 
-                with tracer.start_as_current_span('requester.saving_hrefs') as span_savinghrefs:
-                    total_urls_saved = 0
-                    start_timer_saving_hrefs = time.perf_counter()
+                total_urls_saved = 0
+                start_timer_saving_hrefs = time.perf_counter()
 
-                    pages_to_insert = []
-                    status_counter = Counter()
+                pages_to_insert = []
+                status_counter = Counter()
 
-                    for found_url in hrefs:
-                        if not is_valid_url(found_url):
-                            continue
+                for found_url in hrefs:
+                    if not is_valid_url(found_url):
+                        continue
 
-                        domain_url = Domain.extract_hostname(found_url)
-                        domain = domains_created.get(domain_url, None)
+                    domain_url = Domain.extract_hostname(found_url)
+                    domain = domains_created.get(domain_url, None)
 
-                        new_page_recursion_level = self.pager.page.recursion_level + 1
+                    if domain is None:
+                        continue
 
-                        if self.pager.domain.id != domain.id:
-                            new_page_recursion_level = 0
+                    new_page_recursion_level = self.pager.page.recursion_level + 1
 
-                        if not self.has_more_recursion_limit_specific(
-                            domain.recursion_level, new_page_recursion_level
-                        ):
-                            status = PageStatus.BLOCKED_LIMIT_RECURSION
-                        elif is_domain_blocked(found_url):
-                            status = PageStatus.DOMAIN_BLOCKED
-                        elif not is_desired_lang:
-                            status = PageStatus.BLOCKED_LANGUAGE
-                        else:
-                            status = PageStatus.TODO
+                    if self.pager.domain.id != domain.id:
+                        # if the domain changes, reset the recursion level for the page
+                        new_page_recursion_level = 0
 
-                        pages_to_insert.append(
-                            {
-                                'domain_id': domain.id,
-                                'parent_page_id': self.pager.page.id,
-                                'same_as': None,
-                                'url': found_url,
-                                'url_md5': md5_bin16(found_url),
-                                'recursion_level': self.pager.page.recursion_level + 1,
-                                'status': status.value,
-                            }
-                        )
-                        status_counter[status.value] += 1
-                    total_urls_saved = Page.bulk_insert_ignore(pages_to_insert)
+                    if not self.has_more_recursion_limit_specific(
+                        domain.recursion_level, new_page_recursion_level
+                    ):
+                        status = PageStatus.BLOCKED_LIMIT_RECURSION
+                    elif is_domain_blocked(found_url):
+                        status = PageStatus.DOMAIN_BLOCKED
+                    elif not is_desired_lang:
+                        status = PageStatus.BLOCKED_LANGUAGE
+                    else:
+                        status = PageStatus.TODO
 
-                    for status, count in status_counter.items():
-                        metric_pages_saved_with_status.add(
-                            count,
-                            {
-                                'service': 'miner',
-                                'status': status,
-                            },
-                        )
-                    span_savinghrefs.set_attribute('total_saved', total_urls_saved)
+                    pages_to_insert.append(
+                        {
+                            'domain_id': domain.id,
+                            'parent_page_id': self.pager.page.id,
+                            'same_as': None,
+                            'url': found_url,
+                            'url_md5': md5_bin16(found_url),
+                            'recursion_level': new_page_recursion_level,
+                            'status': status.value,
+                        }
+                    )
+                    status_counter[status.value] += 1
+                total_urls_saved = Page.bulk_insert_ignore(pages_to_insert)
 
-                    metric_saving_found_hrefs_duration.record(
-                        (time.perf_counter() - start_timer_saving_hrefs),
-                        {'service': 'miner'},
+                for status, count in status_counter.items():
+                    metric_pages_saved_with_status.add(
+                        count,
+                        {
+                            'service': 'miner',
+                            'status': status,
+                        },
                     )
 
-                    duration_saving_hrefs = time.perf_counter() - start_timer_saving_hrefs
+                duration_saving_hrefs = time.perf_counter() - start_timer_saving_hrefs
+
+                metric_saving_found_hrefs_duration.record(
+                    duration_saving_hrefs,
+                    {'service': 'miner'},
+                )
 
                 self._log_info(f'Saved {total_urls_saved} new URLs')
+                span.set_status(Status(StatusCode.OK))
 
                 duration_entire_method = time.perf_counter() - start_timer_request
                 metric_request_duration.record(
@@ -349,46 +377,63 @@ class Requester:
                 return True
 
             except PlaywrightTimeout:
-                self._log_warning('Halting: Timeout error')
-                self.pager.page.update(status=PageStatus.TODO)
+                self._halt(
+                    span, page_status=PageStatus.TODO, reason='Timeout error3', level='warning'
+                )
                 return None
 
-            except (TargetClosedError, PlaywrightError):
+            except (TargetClosedError, PlaywrightError) as e:
                 if self.shutdown_event and self.shutdown_event.is_set():
-                    self._log_warning('Halting: Playwright encerrado durante shutdown')
-                    self.pager.page.update(status=PageStatus.TODO)
+                    self._halt(
+                        span,
+                        page_status=PageStatus.TODO,
+                        reason='Shutdown closed playwright',
+                        level='warning',
+                        exc=e,
+                    )
                     return None
-
-                self._log_warning('Halting: Playwright falhou fora do shutdown')
-                self.pager.page.update(status=PageStatus.TODO)
+                self._halt(
+                    span,
+                    page_status=PageStatus.TODO,
+                    reason='TargetClosedError, PlaywrightError',
+                    level='warning',
+                    exc=e,
+                )
                 return None
 
             except AttributeError as e:
-                if '_playwright' in str(e):
-                    if self.shutdown_event and self.shutdown_event.is_set():
-                        self._log_warning(
-                            'Halting: Playwright initialization interrupted during shutdown'
-                        )
-                        self.pager.page.update(status=PageStatus.TODO)
-                        return None
-                    self._log_warning('Halting: Playwright initialization failed')
-                    self.pager.page.update(status=PageStatus.TODO)
-                    return None
-                raise
+                self._halt(
+                    span,
+                    page_status=PageStatus.TODO,
+                    reason='AttributeError as e',
+                    level='warning',
+                    exc=e,
+                )
+                raise e
 
             except KeyboardInterrupt:
-                self._log_info('Halting: Interrompido por sinal')
-                self.pager.page.update(status=PageStatus.TODO)
+                self._halt(
+                    span, page_status=PageStatus.TODO, reason='KeyboardInterrupt', level='info'
+                )
                 return None
 
             except Exception as e:
-                self._log_error('Halting: Generic captured exception', extra={'exception': e})
-                self.logger.exception('Halting: Generic captured exception')
-                self.pager.page.update(status=PageStatus.FAILED)
+                self._halt(
+                    span,
+                    page_status=PageStatus.FAILED,
+                    reason='Generic Exception',
+                    level='error',
+                    exc=e,
+                )
                 return None
 
             finally:
                 pass
 
-            self._log_error('This log should not be reached.')
+            self._halt(
+                span,
+                page_status=PageStatus.FAILED,
+                reason='Generic Exception',
+                level='error',
+            )
             return None

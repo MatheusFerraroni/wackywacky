@@ -16,3 +16,9 @@ build
 tmp
 .env
 .DS_Store
+resource_output/
+prometheus_data/
+otel_data/
+mysql_data/
+jaeger_data/
+.env.example

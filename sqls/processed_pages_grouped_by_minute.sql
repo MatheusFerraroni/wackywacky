@@ -5,4 +5,5 @@ SELECT
 FROM pages
 WHERE status = 'done'
 GROUP BY minute_window
-ORDER BY minute_window;
+ORDER BY minute_window DESC
+LIMIT 1000;

@@ -13,7 +13,6 @@ from miner.requester import Requester
 from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
 from miner.leader import LeaderElection
-from opentelemetry import trace
 import threading
 from miner.enums import PageStatus
 from contextlib import suppress
@@ -27,8 +26,6 @@ from miner.metrics import (
 )
 
 from playwright.sync_api import sync_playwright
-
-tracer = trace.get_tracer(__name__)
 
 
 class App:
@@ -102,172 +99,162 @@ class App:
         if self.shutdown_event.is_set():
             return SystemStatus.STOPPING
 
-        with tracer.start_as_current_span('app.get_system_status'):
-            raw = SettingsDB().get_config('system_status', refresh=True)
+        raw = SettingsDB().get_config('system_status', refresh=True)
 
-            if raw is None:
+        if raw is None:
+            return SystemStatus.ERROR
+
+        if isinstance(raw, SystemStatus):
+            return raw
+
+        if isinstance(raw, str):
+            try:
+                return SystemStatus(raw.lower())
+            except ValueError:
                 return SystemStatus.ERROR
 
-            if isinstance(raw, SystemStatus):
-                return raw
-
-            if isinstance(raw, str):
-                try:
-                    return SystemStatus(raw.lower())
-                except ValueError:
-                    return SystemStatus.ERROR
-
-            return SystemStatus.ERROR
+        return SystemStatus.ERROR
 
     def set_system_status(self, status):
         if not self.leader or not self.leader.is_leader:
             return
-        with tracer.start_as_current_span('app.set_system_status'):
-            if isinstance(status, SystemStatus):
-                normalized = status.value
-            else:
-                raise Exception('Can only use SystemStatus type')
 
-            json_value = json.dumps(normalized)
+        if isinstance(status, SystemStatus):
+            normalized = status.value
+        else:
+            raise Exception('Can only use SystemStatus type')
 
-            conn = get_connection()
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO settings (`key`, value)
-                    VALUES (%s, CAST(%s AS JSON))
-                    ON DUPLICATE KEY UPDATE value = CAST(%s AS JSON)
-                    """,
-                    ('system_status', json_value, json_value),
-                )
-            conn.commit()
+        json_value = json.dumps(normalized)
+
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO settings (`key`, value)
+                VALUES (%s, CAST(%s AS JSON))
+                ON DUPLICATE KEY UPDATE value = CAST(%s AS JSON)
+                """,
+                ('system_status', json_value, json_value),
+            )
+        conn.commit()
 
     def run(self) -> int:
-        with tracer.start_as_current_span('app.run') as span:
-            self.logger.info('Starting run()')
-            self._install_signal_handlers()
+        self.logger.info('Starting run()')
+        self._install_signal_handlers()
 
-            try:
-                became_leader = self.leader.acquire(timeout_seconds=0)
-                if became_leader:
-                    self.logger.info('This instance is the global leader')
+        try:
+            became_leader = self.leader.acquire(timeout_seconds=0)
+            if became_leader:
+                self.logger.info('This instance is the global leader')
+            else:
+                self.logger.info('This instance is a worker')
+
+            if self.should_reset_db and self.leader.is_leader:
+                self.reset_db()
+
+            while self._running:
+                self.leader.refresh()
+                should_clean_db = self.last_clean_db is None
+
+                if not should_clean_db:
+                    total_seconds = (datetime.now() - self.last_clean_db).total_seconds()
+                    if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
+                        should_clean_db = True
+
+                if should_clean_db and self.leader.is_leader:
+                    self.last_clean_db = datetime.now()
+                    self.clean_db()
+
+                should_log_threads = False
+                if not self.last_log_threads:
+                    should_log_threads = True
                 else:
-                    self.logger.info('This instance is a worker')
-
-                if self.should_reset_db and self.leader.is_leader:
-                    self.reset_db()
-
-                while self._running:
-                    self.leader.refresh()
-                    should_clean_db = self.last_clean_db is None
-
-                    if not should_clean_db:
-                        total_seconds = (datetime.now() - self.last_clean_db).total_seconds()
-                        if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
-                            should_clean_db = True
-
-                    if should_clean_db and self.leader.is_leader:
-                        self.last_clean_db = datetime.now()
-                        self.clean_db()
-
-                    should_log_threads = False
-                    if not self.last_log_threads:
+                    total_seconds = (datetime.now() - self.last_log_threads).total_seconds()
+                    if total_seconds > settings.SECONDS_BETWEEN_LOG_THREADS:
                         should_log_threads = True
-                    else:
-                        total_seconds = (datetime.now() - self.last_log_threads).total_seconds()
-                        if total_seconds > settings.SECONDS_BETWEEN_LOG_THREADS:
-                            should_log_threads = True
 
-                    if should_log_threads:
-                        self.last_log_threads = datetime.now()
-                        self._log_thread_stats()
+                if should_log_threads:
+                    self.last_log_threads = datetime.now()
+                    self._log_thread_stats()
 
-                    self.system_status = self.get_system_status()
-                    span.set_attribute('system.status', self.system_status.value)
-                    self.retry_loop += 1
-                    span.set_attribute('retry_loop', self.retry_loop)
+                self.system_status = self.get_system_status()
+                self.retry_loop += 1
 
-                    match self.system_status:
-                        case SystemStatus.STARTING:
-                            if self.leader.is_leader:
-                                self.logger.info('System is starting')
-                                self.init_starter()
-                            else:
-                                self.logger.info('Waiting for leader to run init_starter')
-                                time.sleep(1)
-                        case SystemStatus.RUNNING_STARTER:
-                            self.logger.info('Waiting leader to finish init_starter')
-                            time.sleep(1)  # just wait until it's ready to mine
-                        case SystemStatus.RUNNING_MINING:
-                            started = self.mine()
+                match self.system_status:
+                    case SystemStatus.STARTING:
+                        if self.leader.is_leader:
+                            self.logger.info('System is starting')
+                            self.init_starter()
+                        else:
+                            self.logger.info('Waiting for leader to run init_starter')
+                            time.sleep(1)
+                    case SystemStatus.RUNNING_STARTER:
+                        self.logger.info('Waiting leader to finish init_starter')
+                        time.sleep(1)  # just wait until it's ready to mine
+                    case SystemStatus.RUNNING_MINING:
+                        started = self.mine()
 
-                            with self.threads_lock:  # prevent early stop with long running threads
-                                if len(self.threads) > 0:
-                                    continue
+                        with self.threads_lock:  # prevent early stop with long running threads
+                            if len(self.threads) > 0:
+                                continue
 
-                            if started:
-                                self.retry_loop = 0
-                            else:
-                                time.sleep(0.5)
-                        case SystemStatus.COMPLETED:
-                            self.logger.info(f'System status is {SystemStatus.COMPLETED}. Quitting')
-                            self._running = False
-                        case SystemStatus.STOPPING:
-                            self.logger.info(f'System status is {SystemStatus.STOPPING}. Quitting')
-                            self._running = False
-                        case SystemStatus.ERROR:
-                            self.logger.error('Error. Quitting')
-                            self._running = False
-                        case _:
-                            self.logger.info('Default system status. Quiting.')
-                            self._running = False
-
-                    if self.retry_loop >= self.max_retry_loop:
-                        span.add_event('max_retry_reached')
+                        if started:
+                            self.retry_loop = 0
+                        else:
+                            time.sleep(0.5)
+                    case SystemStatus.COMPLETED:
+                        self.logger.info(f'System status is {SystemStatus.COMPLETED}. Quitting')
                         self._running = False
-                return 0
+                    case SystemStatus.STOPPING:
+                        self.logger.info(f'System status is {SystemStatus.STOPPING}. Quitting')
+                        self._running = False
+                    case SystemStatus.ERROR:
+                        self.logger.error('Error. Quitting')
+                        self._running = False
+                    case _:
+                        self.logger.info('Default system status. Quiting.')
+                        self._running = False
 
-            except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
-                self.logger.exception('Failed to execute')
-                return 1
-            finally:
-                self.logger.info('Waiting miner threads to finish')
-                with self.threads_lock:
-                    threads_snapshot = list(self.threads)
-                for t in threads_snapshot:
-                    t.join(timeout=1)
-                close_connection()
-                self.logger.info('Graceful shutdown completed')
+                if self.retry_loop >= self.max_retry_loop:
+                    self._running = False
+            return 0
+
+        except Exception as e:
+            self.logger.exception('Failed to execute')
+            self.logger.exception(e)
+            return 1
+        finally:
+            self.logger.info('Waiting miner threads to finish')
+            with self.threads_lock:
+                threads_snapshot = list(self.threads)
+            for t in threads_snapshot:
+                t.join(timeout=1)
+            close_connection()
+            self.logger.info('Graceful shutdown completed')
 
     def init_starter(self):
-        with tracer.start_as_current_span('app.init_starter') as span:
-            self.set_system_status(SystemStatus.RUNNING_STARTER)
-            starter = Starter()
-            init_urls = starter.get_init_urls()
-            span.set_attribute('starter.init_urls.count', len(init_urls))
+        self.set_system_status(SystemStatus.RUNNING_STARTER)
+        starter = Starter()
+        init_urls = starter.get_init_urls()
 
-            for init_url in init_urls:
-                domain = Domain.get_or_create(init_url)
-                Page.get_or_create(domain_id=domain.id, url=init_url)
-                # page = Pager(init_url)
-                # page.save()
+        for init_url in init_urls:
+            domain = Domain.get_or_create(init_url)
+            Page.get_or_create(domain_id=domain.id, url=init_url)
+            # page = Pager(init_url)
+            # page.save()
 
-            self.set_system_status(SystemStatus.RUNNING_MINING)
+        self.set_system_status(SystemStatus.RUNNING_MINING)
 
     def clean_db(self):
-        with tracer.start_as_current_span('app.clean_db') as span:
-            start_timer = time.perf_counter()
-            self.logger.info('Releasing stucked pages DB')
-            total = Page.release_stucked_processing()
-            metric_pages_released.add(total, {'service': 'miner', 'leader': self.leader.is_leader})
-            span.set_attribute('db.pages_released', total)
-            self.logger.info(f'Released {total} pages')
-            metric_clean_db_duration.record(
-                (time.perf_counter() - start_timer),
-                {'service': 'miner', 'leader': self.leader.is_leader},
-            )
+        start_timer = time.perf_counter()
+        self.logger.info('Releasing stucked pages DB')
+        total = Page.release_stucked_processing()
+        metric_pages_released.add(total, {'service': 'miner', 'leader': self.leader.is_leader})
+        self.logger.info(f'Released {total} pages')
+        metric_clean_db_duration.record(
+            (time.perf_counter() - start_timer),
+            {'service': 'miner', 'leader': self.leader.is_leader},
+        )
 
     def generate_worker_name(self):
         self.worker_id += 1
@@ -335,65 +322,82 @@ class App:
         context = None
         browser = None
 
+        recreate_browser_every = 200
+        processed = recreate_browser_every + 1
+
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--no-sandbox',
-                        '--disable-dev-shm-usage',
-                    ],
-                )
-                context = self._build_context(browser)
-                page = context.new_page()
-                self._block_unneeded_resources(page)
+                try:
+                    while not self.shutdown_event.is_set():
+                        if processed >= recreate_browser_every:
+                            processed = 0
+                            if page is not None:
+                                with suppress(Exception):
+                                    page.close()
+                                page = None
 
-                with tracer.start_as_current_span('app.mine') as span:
-                    try:
+                            if context is not None:
+                                with suppress(Exception):
+                                    context.close()
+                                context = None
+
+                            if browser is not None:
+                                with suppress(Exception):
+                                    browser.close()
+                                browser = None
+                            browser = pw.chromium.launch(
+                                headless=True,
+                                args=[
+                                    '--disable-blink-features=AutomationControlled',
+                                    '--no-sandbox',
+                                    '--disable-dev-shm-usage',
+                                ],
+                            )
+                            context = self._build_context(browser)
+                            page = context.new_page()
+                            self._block_unneeded_resources(page)
+                        url = None
+
                         while not self.shutdown_event.is_set():
-                            url = None
+                            with self.lock_claim_url:
+                                url = Page.claim_next_todo_url()
 
-                            while not self.shutdown_event.is_set():
-                                with self.lock_claim_url:
-                                    url = Page.claim_next_todo_url()
+                            if url is not None:
+                                break
+                            time.sleep(random.random() * 0.5)
 
-                                if url is not None:
-                                    break
-                                time.sleep(random.random() * 0.5)
+                        if self.shutdown_event.is_set():
+                            return
 
-                            if self.shutdown_event.is_set():
-                                return
+                        if url is None:
+                            self.logger.warning('Nothing to mine')
+                            return
 
-                            if url is None:
-                                span.add_event('nothing_to_mine')
-                                self.logger.warning('Nothing to mine')
-                                return
+                        pager = Pager(url)
+                        pager.load()
 
-                            span.set_attribute('page.url', url)
-                            pager = Pager(url)
-                            pager.load()
+                        if self.shutdown_event.is_set():
+                            pager.page.update(status=PageStatus.TODO)
+                            self.logger.info('Detected shutdown event')
+                            return
 
-                            if self.shutdown_event.is_set():
-                                pager.page.update(status=PageStatus.TODO)
-                                self.logger.info('Detected shutdown event')
-                                return
+                        requester = Requester(shutdown_event=self.shutdown_event)
+                        requester.prepare(pager)
 
-                            requester = Requester(shutdown_event=self.shutdown_event)
-                            requester.prepare(pager)
-                            with tracer.start_as_current_span('app.requesting'):
-                                start_timer = time.perf_counter()
-                                try:
-                                    requester.request(page)
-                                except Exception:
-                                    self.logger.exception('Unhandled exception inside requester')
-                                metric_any_request_duration.record(
-                                    (time.perf_counter() - start_timer),
-                                    {'service': 'miner', 'leader': self.leader.is_leader},
-                                )
-                    except Exception as e:
-                        self.logger.exception('Unhandled exception in miner thread')
-                        raise e
+                        start_timer = time.perf_counter()
+                        try:
+                            processed += 1
+                            requester.request(page)
+                        except Exception:
+                            self.logger.exception('Unhandled exception inside requester')
+                        metric_any_request_duration.record(
+                            (time.perf_counter() - start_timer),
+                            {'service': 'miner', 'leader': self.leader.is_leader},
+                        )
+
+                except Exception as e:
+                    self.logger.exception('Unhandled exception in miner thread')
+                    raise e
 
         finally:
             if page is not None:

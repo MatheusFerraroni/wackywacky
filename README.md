@@ -266,8 +266,8 @@ All collected data is stored in **MySQL**, including:
 # TODO
 
 - Export crawled data from MySQL
-- Finish worker Docker image
 - Workers with page in `processing` status should peridically refresh the page.updated_at to prevent false release page
+- Deeper time perf inside request
 
 ---
 

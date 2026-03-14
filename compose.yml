@@ -44,6 +44,7 @@ services:
       BADGER_DIRECTORY_KEY: /badger/key
     ports:
       - "16686:16686"
+      - "14269:14269"
     volumes:
       - ./jaeger_data/data:/badger/data
       - ./jaeger_data/key:/badger/key
@@ -112,7 +113,7 @@ services:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318
       OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318
-      MAX_THREADS: 5
+      MAX_THREADS: 2
       DATABASE_URL: mysql+pymysql://appuser:apppass@mysql:3306/appdb
       OTEL_SERVICE_NAME: miner
       OTEL_SERVICE_VERSION: 1.0.0
