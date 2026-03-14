@@ -249,6 +249,7 @@ class Page:
         retry_interval_seconds = int(retry_interval_ms / 1000)
 
         conn = get_connection()
+
         max_recursion = SettingsDB().get_config('max_recursion')
         max_recursion_page = SettingsDB().get_config('max_recursion_page')
         max_retry_attempts = SettingsDB().get_config('max_retry_attempts')
@@ -256,54 +257,28 @@ class Page:
         try:
             with conn.cursor() as cur:
                 with lock_claim_next:
+
+                    # -------- First attempt: TODO --------
                     cur.execute(
                         """
-                        SELECT *
-                        FROM (
-                            (
-                                SELECT
-                                    p.id,
-                                    p.url,
-                                    d.id AS domain_id
-                                FROM pages p
-                                INNER JOIN domain d
-                                    ON d.id = p.domain_id
-                                WHERE
-                                    p.recursion_level < %s
-                                    AND d.recursion_level < %s
-                                    AND p.retry_count < %s
-                                    AND (
-                                        d.last_request_at IS NULL
-                                        OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                    )
-                                    AND p.status = %s
-                                LIMIT 20
-                                FOR UPDATE SKIP LOCKED
+                        SELECT
+                            p.id,
+                            p.url,
+                            d.id AS domain_id
+                        FROM pages p
+                        INNER JOIN domain d
+                            ON d.id = p.domain_id
+                        WHERE
+                            p.recursion_level < %s
+                            AND d.recursion_level < %s
+                            AND p.retry_count < %s
+                            AND (
+                                d.last_request_at IS NULL
+                                OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
                             )
-                            UNION ALL
-                            (
-                                SELECT
-                                    p.id,
-                                    p.url,
-                                    d.id AS domain_id
-                                FROM pages p
-                                INNER JOIN domain d
-                                    ON d.id = p.domain_id
-                                WHERE
-                                    p.recursion_level < %s
-                                    AND d.recursion_level < %s
-                                    AND p.retry_count < %s
-                                    AND (
-                                        d.last_request_at IS NULL
-                                        OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                    )
-                                    AND p.status = %s
-                                    AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                LIMIT 20
-                                FOR UPDATE SKIP LOCKED
-                            )
-                        ) AS candidates
+                            AND p.status = %s
                         LIMIT 20
+                        FOR UPDATE SKIP LOCKED
                         """,
                         [
                             max_recursion_page,
@@ -311,15 +286,46 @@ class Page:
                             max_retry_attempts,
                             domain_cooldown_seconds,
                             PageStatus.TODO.value,
-                            max_recursion_page,
-                            max_recursion,
-                            max_retry_attempts,
-                            domain_cooldown_seconds,
-                            PageStatus.FAILED.value,
-                            retry_interval_seconds,
                         ],
                     )
+
                     rows = cur.fetchall()
+
+                    # -------- If no TODO found, try FAILED --------
+                    if not rows:
+                        cur.execute(
+                            """
+                            SELECT
+                                p.id,
+                                p.url,
+                                d.id AS domain_id
+                            FROM pages p
+                            INNER JOIN domain d
+                                ON d.id = p.domain_id
+                            WHERE
+                                p.recursion_level < %s
+                                AND d.recursion_level < %s
+                                AND p.retry_count < %s
+                                AND (
+                                    d.last_request_at IS NULL
+                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                )
+                                AND p.status = %s
+                                AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                            LIMIT 20
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            [
+                                max_recursion_page,
+                                max_recursion,
+                                max_retry_attempts,
+                                domain_cooldown_seconds,
+                                PageStatus.FAILED.value,
+                                retry_interval_seconds,
+                            ],
+                        )
+
+                        rows = cur.fetchall()
 
                     if not rows:
                         conn.rollback()
@@ -346,7 +352,7 @@ class Page:
                     )
 
                 conn.commit()
-            return row['id']
+                return row['id']
 
         except Exception:
             conn.rollback()

@@ -90,6 +90,12 @@ CREATE TABLE `pages` (
 
   KEY `idx_pages_worker` (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`),
 
+  KEY `idx_pages_todo_pick`
+    (`status`, `recursion_level`, `retry_count`, `domain_id`, `id`),
+
+  KEY `idx_pages_failed_pick`
+    (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`, `id`),
+
   CONSTRAINT `fk_pages_domain`
     FOREIGN KEY (`domain_id`) REFERENCES `domain` (`id`)
     ON DELETE CASCADE
@@ -108,6 +114,7 @@ CREATE TABLE `pages` (
 ) ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_0900_ai_ci;
+
 
 CREATE TABLE `settings` (
   `id` INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,

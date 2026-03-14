@@ -149,13 +149,6 @@ class Requester:
         values_to_log = [('Total', total_duration)]
 
         for name, item in self.timer.items():
-            print(
-                name,
-                item,
-                item['count_towards_total'],
-                item['completed'],
-                item['count_towards_total'] and item['completed'],
-            )
             if item['count_towards_total'] and item['completed']:
                 total_measured += item['duration']
 
