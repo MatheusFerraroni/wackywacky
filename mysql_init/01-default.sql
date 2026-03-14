@@ -176,7 +176,7 @@ INSERT INTO `settings` (`key`, `value`, `description`) VALUES
   (
     'max_recursion_page',
     JSON_EXTRACT('4', '$'),
-    'Max recursion increasing to new pages, reset every new domain.'
+    'Max recursion increasing to new pages.'
   ),
   (
     'system_status',

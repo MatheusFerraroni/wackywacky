@@ -339,6 +339,13 @@ class Requester:
                 )
                 self.end_timer('page.save_results')
 
+                if new_status == PageStatus.BLOCKED_LANGUAGE:
+                    self._halt(
+                        span,
+                        reason='Wrong language detected',
+                    )
+                    return
+
                 self.start_timer('domain.bulk_save', count_towards_total=True)
                 domains_created = Domain.bulk_get_or_create(hrefs, self.pager.domain)
                 self.end_timer('domain.bulk_save')
@@ -362,10 +369,6 @@ class Requester:
                         continue
 
                     new_page_recursion_level = self.pager.page.recursion_level + 1
-
-                    if self.pager.domain.id != domain.id:
-                        # if the domain changes, reset the recursion level for the page
-                        new_page_recursion_level = 0
 
                     if not self.has_more_recursion_limit_specific(
                         domain.recursion_level, new_page_recursion_level

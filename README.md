@@ -101,7 +101,7 @@ Total entries:
 
 ```
 
-5,006,011 domains
+5,163,510 domains
 
 ```
 
