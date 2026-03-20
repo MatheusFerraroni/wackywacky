@@ -9,7 +9,6 @@ from playwright._impl._errors import TargetClosedError
 import time
 import threading
 from collections import Counter
-from miner.models.utils import md5_bin16
 from miner.models import Page, Domain
 from opentelemetry.trace.status import Status, StatusCode
 
@@ -387,7 +386,7 @@ class Requester:
                             'parent_page_id': self.pager.page.id,
                             'same_as': None,
                             'url': found_url,
-                            'url_md5': md5_bin16(found_url),
+                            'url_md5': Page.url_to_md5(found_url),
                             'recursion_level': new_page_recursion_level,
                             'status': status.value,
                         }

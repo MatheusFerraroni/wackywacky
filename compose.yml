@@ -1,6 +1,6 @@
 services:
   mysql:
-    image: mysql:8.0
+    image: mysql:8.0.45
     container_name: mysql
     environment:
       MYSQL_DATABASE: appdb

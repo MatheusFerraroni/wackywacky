@@ -16,7 +16,7 @@ from miner.leader import LeaderElection
 import threading
 from miner.enums import PageStatus
 from contextlib import suppress
-from miner.models import Domain, Page
+from miner.models import Domain, Page, PageComplete
 
 from miner.metrics import (
     metric_pages_released,
@@ -33,8 +33,6 @@ class App:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._running = True
 
-        self.last_clean_db = None
-
         self.retry_loop = 0
         self.max_retry_loop = 10
         self.threads = []
@@ -43,13 +41,59 @@ class App:
         self.lock_claim_url = threading.RLock()
         self.worker_id = 0
 
-        self.last_log_threads = None
         self._last_threads_alive = 0
 
         self.leader = LeaderElection()
         self._leader_checked = False
 
         self.should_reset_db = reset_db
+
+        self.last_system_status = None
+
+        self.last_execution_timers = {
+            'last_system_status_time': None,
+            'last_clean_db': datetime.now(),
+            'last_log_threads': datetime.now(),
+            'last_move_complete_pages': datetime.now(),
+        }
+
+    def check_timers_executions(self):
+        should_clean_db = self.last_execution_timers['last_clean_db'] is None
+        if not should_clean_db:
+            total_seconds = (
+                datetime.now() - self.last_execution_timers['last_clean_db']
+            ).total_seconds()
+            if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
+                should_clean_db = True
+        if should_clean_db and self.leader.is_leader:
+            self.last_execution_timers['last_clean_db'] = datetime.now()
+            self.clean_db()
+
+        should_move_complete_pages = self.last_execution_timers['last_move_complete_pages'] is None
+        if not should_move_complete_pages:
+            total_seconds = (
+                datetime.now() - self.last_execution_timers['last_move_complete_pages']
+            ).total_seconds()
+            if total_seconds > settings.SECONDS_BETWEEN_MOVE_COMPLETE_PAGES:
+                should_move_complete_pages = True
+        if should_move_complete_pages and self.leader.is_leader:
+            self.last_execution_timers['last_move_complete_pages'] = datetime.now()
+            total_moved = PageComplete.transfer_to_complete()
+
+            self.logger.info('Moved %s completed pages', total_moved)
+
+        should_log_threads = False
+        if not self.last_execution_timers['last_log_threads']:
+            should_log_threads = True
+        else:
+            total_seconds = (
+                datetime.now() - self.last_execution_timers['last_log_threads']
+            ).total_seconds()
+            if total_seconds > settings.SECONDS_BETWEEN_LOG_THREADS:
+                should_log_threads = True
+        if should_log_threads:
+            self.last_execution_timers['last_log_threads'] = datetime.now()
+            self._log_thread_stats()
 
     def reset_db(self):
         self.logger.info('Cleaning DB started')
@@ -59,6 +103,8 @@ class App:
             try:
                 cursor.execute('TRUNCATE TABLE pages')
                 cursor.execute('TRUNCATE TABLE domain')
+                cursor.execute('TRUNCATE TABLE pages_complete')
+                cursor.execute('TRUNCATE TABLE cache_url')
                 cursor.execute(
                     """
                     UPDATE settings
@@ -99,21 +145,45 @@ class App:
         if self.shutdown_event.is_set():
             return SystemStatus.STOPPING
 
+        should_update_system_status = False
+
+        if (
+            self.last_system_status != SystemStatus.STARTING
+            and self.last_system_status != SystemStatus.RUNNING_STARTER
+        ):
+            if self.last_execution_timers['last_system_status_time'] is not None:
+                total_seconds = (
+                    datetime.now() - self.last_execution_timers['last_system_status_time']
+                ).total_seconds()
+                if total_seconds > settings.SECONDS_BETWEEN_UPDATE_SYSTEM_STATUS:
+                    should_update_system_status = True
+            else:
+                should_update_system_status = True
+
+            if not should_update_system_status:
+                return self.last_system_status
+
+        self.last_execution_timers['last_system_status_time'] = datetime.now()
         raw = SettingsDB().get_config('system_status', refresh=True)
 
         if raw is None:
-            return SystemStatus.ERROR
+            self.last_system_status = SystemStatus.ERROR
+            return self.last_system_status
 
         if isinstance(raw, SystemStatus):
-            return raw
+            self.last_system_status = raw
+            return self.last_system_status
 
         if isinstance(raw, str):
             try:
-                return SystemStatus(raw.lower())
+                self.last_system_status = SystemStatus(raw.lower())
+                return self.last_system_status
             except ValueError:
-                return SystemStatus.ERROR
+                self.last_system_status = SystemStatus.ERROR
+                return self.last_system_status
 
-        return SystemStatus.ERROR
+        self.last_system_status = SystemStatus.ERROR
+        return self.last_system_status
 
     def set_system_status(self, status):
         if not self.leader or not self.leader.is_leader:
@@ -154,28 +224,8 @@ class App:
 
             while self._running:
                 self.leader.refresh()
-                should_clean_db = self.last_clean_db is None
 
-                if not should_clean_db:
-                    total_seconds = (datetime.now() - self.last_clean_db).total_seconds()
-                    if total_seconds > settings.SECONDS_BETWEEN_CLEAN_DB:
-                        should_clean_db = True
-
-                if should_clean_db and self.leader.is_leader:
-                    self.last_clean_db = datetime.now()
-                    self.clean_db()
-
-                should_log_threads = False
-                if not self.last_log_threads:
-                    should_log_threads = True
-                else:
-                    total_seconds = (datetime.now() - self.last_log_threads).total_seconds()
-                    if total_seconds > settings.SECONDS_BETWEEN_LOG_THREADS:
-                        should_log_threads = True
-
-                if should_log_threads:
-                    self.last_log_threads = datetime.now()
-                    self._log_thread_stats()
+                self.check_timers_executions()
 
                 self.system_status = self.get_system_status()
                 self.retry_loop += 1
@@ -196,6 +246,7 @@ class App:
 
                         with self.threads_lock:  # prevent early stop with long running threads
                             if len(self.threads) > 0:
+                                time.sleep(0.5)
                                 continue
 
                         if started:
@@ -240,8 +291,6 @@ class App:
         for init_url in init_urls:
             domain = Domain.get_or_create(init_url)
             Page.get_or_create(domain_id=domain.id, url=init_url)
-            # page = Pager(init_url)
-            # page.save()
 
         self.set_system_status(SystemStatus.RUNNING_MINING)
 

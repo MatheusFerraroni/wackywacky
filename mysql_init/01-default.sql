@@ -96,21 +96,82 @@ CREATE TABLE `pages` (
   KEY `idx_pages_failed_pick`
     (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`, `id`),
 
-  CONSTRAINT `fk_pages_domain`
-    FOREIGN KEY (`domain_id`) REFERENCES `domain` (`id`)
-    ON DELETE CASCADE
-    ON UPDATE CASCADE,
+) ENGINE=InnoDB
+DEFAULT CHARSET=utf8mb4
+COLLATE=utf8mb4_0900_ai_ci;
 
-  CONSTRAINT `fk_pages_parent`
-    FOREIGN KEY (`parent_page_id`) REFERENCES `pages` (`id`)
-    ON DELETE SET NULL
-    ON UPDATE CASCADE,
 
-  CONSTRAINT `fk_pages_same_as`
-    FOREIGN KEY (`same_as`) REFERENCES `pages` (`id`)
-    ON DELETE SET NULL
-    ON UPDATE CASCADE
+CREATE TABLE `pages_complete` (
+  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `domain_id` INT UNSIGNED NOT NULL,
+  `parent_page_id` INT UNSIGNED NULL,
+  `same_as` INT UNSIGNED NULL,
 
+  `url` TEXT NOT NULL,
+  `url_md5` BINARY(16) NOT NULL,
+
+  `url_final` TEXT NULL,
+  `url_final_md5` BINARY(16) NULL,
+
+  `status_code` SMALLINT UNSIGNED NULL,
+  `title` VARCHAR(512) NULL,
+
+  `recursion_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+
+  `status` ENUM(
+    'todo',
+    'processing',
+    'done',
+    'failed',
+    'failed_timeout',
+    'blocked_domain',
+    'blocked_limit_recursion',
+    'blocked_language'
+  ) NOT NULL DEFAULT 'todo',
+
+  `retry_count` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+
+  `text` BLOB NULL,
+  `html` BLOB NULL,
+  `text_md5` BINARY(16) NULL,
+  `html_md5` BINARY(16) NULL,
+
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY `uq_pages_url_md5` (`url_md5`),
+  UNIQUE KEY `uq_pages_text_md5` (`text_md5`),
+  UNIQUE KEY `uq_pages_html_md5` (`html_md5`),
+
+  KEY `idx_pages_domain_id` (`domain_id`),
+  KEY `idx_pages_parent_page_id` (`parent_page_id`),
+  KEY `idx_pages_same_as` (`same_as`),
+  KEY `idx_pages_recursion_level` (`recursion_level`),
+
+  KEY `idx_pages_status` (`status`),
+  KEY `idx_pages_status_created_at` (`status`, `created_at`),
+  KEY `idx_pages_status_updated_at` (`status`, `updated_at`),
+
+  KEY `idx_pages_retry_count` (`retry_count`),
+  KEY `idx_pages_updated_at` (`updated_at`),
+
+  KEY `idx_pages_url_final_md5` (`url_final_md5`),
+
+  KEY `idx_pages_worker` (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`),
+
+  KEY `idx_pages_todo_pick`
+    (`status`, `recursion_level`, `retry_count`, `domain_id`, `id`),
+
+  KEY `idx_pages_failed_pick`
+    (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`, `id`)
+) ENGINE=InnoDB
+DEFAULT CHARSET=utf8mb4
+COLLATE=utf8mb4_0900_ai_ci;
+
+
+CREATE TABLE `cache_url` (
+  `url_md5` BINARY(16) NOT NULL PRIMARY KEY,
+  `url` TEXT NOT NULL
 ) ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_0900_ai_ci;

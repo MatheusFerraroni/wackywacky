@@ -53,5 +53,9 @@ class Settings:  # pylint: disable=too-few-public-methods
     SAVE_HTML = os.getenv('SAVE_HTML', 'False').lower() == 'true'
     MAX_CHARACTERS_TEXT = int(os.getenv('MAX_CHARACTERS_TEXT', '1000000'))
 
+    SECONDS_BETWEEN_UPDATE_SYSTEM_STATUS = 60
+
+    SECONDS_BETWEEN_MOVE_COMPLETE_PAGES = 60
+
 
 settings = Settings()

@@ -28,7 +28,7 @@ def _create_connection(max_wait_seconds=150, retry_interval=2):
                 password=settings.DB_PASSWORD,
                 database=settings.DB_NAME,
                 cursorclass=pymysql.cursors.DictCursor,
-                autocommit=True,
+                autocommit=False,
             )
             logger.info('DB connection established successfully')
             return conn
