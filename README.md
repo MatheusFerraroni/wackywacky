@@ -1,127 +1,114 @@
+
 # WackyWacky
 
-WackyWacky is a lightweight experimental **web crawler** focused on controlled web exploration.
-
-The crawler collects pages, extracts links, and recursively visits discovered URLs while applying **domain filtering**, **language detection**, and **rate-limiting**.
-
-The project also includes a complete **observability stack** for monitoring crawler behavior and performance.
+Crawler web experimental, distribuído e observável, projetado para exploração controlada da web com foco em robustez, controle de carga e rastreabilidade.
 
 ---
 
-# Features
+## Overview
 
-- Recursive web crawling
-- Domain blocklist filtering
-- Language filtering
-- Domain rate-limiting
-- Retry and recursion limits
-- Multi-threaded workers
-- Observability with metrics, logs, and traces
-- Multi-query crawler starter
-- Save compressed text and html data
+O WackyWacky executa crawling recursivo a partir de queries iniciais, aplicando:
 
-* By default, only the texts are saved to reduce the amount of generated data. Enable html saving in the settings.
+- controle de recursão
+- rate limit por domínio
+- retry automático
+- filtragem de idioma
+- bloqueio de domínios
+- deduplicação por conteúdo
 
----
-
-# Multi Query Starter
-
-The crawler begins by generating a set of initial queries.
-
-By default, queries are executed against **Wikipedia**:
-
-```
-
-miner/starter/wikipedia.py
-
-```
-
-The search terms used to build the queries are stored in:
-
-```
-
-mysql_init/editable.sql
-
-```
-
-These initial queries seed the crawler with URLs that will be recursively explored.
+O sistema é multi-worker, coordenado via banco (MySQL), e totalmente instrumentado com OpenTelemetry.
 
 ---
 
-# Observability Stack
+## Arquitetura
 
-The crawler is fully instrumented using **OpenTelemetry**.
+```
 
-Included services:
+Leader (1)
+└── controla estado global (DB)
 
-- Grafana
-- Jaeger
-- OpenTelemetry Collector
-- Loki
-- Prometheus
+Workers (N)
+└── consomem páginas
+└── executam crawling com Playwright
 
-These tools provide:
+```
 
-- distributed tracing
-- metrics collection
-- centralized logging
-- monitoring dashboards
+- Coordenação distribuída via `GET_LOCK` (MySQL)
+- Estado global em `settings.system_status`
+- Filas implícitas via tabela `pages`
 
 ---
 
-# Grafana
+## Fluxo
 
-Local access:
-
-```
-
-[http://localhost:3000](http://localhost:3000)
-
-```
-
-Default credentials:
-
-```
-
-admin / admin
-
-```
+1. Leader inicializa (`STARTING`)
+2. Starter gera URLs iniciais
+3. Sistema entra em `RUNNING_MINING`
+4. Workers:
+   - claim de páginas (`TODO`)
+   - processamento
+   - extração de links
+   - inserção de novas páginas
+5. Loop até exaustão ou parada
 
 ---
 
-# Domain Block List
+## Principais Componentes
 
-The crawler uses a domain blacklist to avoid crawling unwanted or unsafe websites.
+### `App`
+Orquestrador:
 
-Default source:
+- leader election
+- controle de estado
+- gerenciamento de threads
+- limpeza de páginas travadas
 
-https://dsi.ut-capitole.fr/blacklists/index_en.php
+### `Requester`
+Core do crawler:
 
-Total entries:
+- navegação via Playwright
+- extração de conteúdo
+- aplicação de regras
+- persistência
 
-```
+### `Page` / `Domain`
+Modelo de dados:
 
-5,163,510 domains
+- controle de status e retry
+- limitação por domínio
+- deduplicação por hash
 
-```
+### `Starter`
+Geração de seeds:
 
-Because of the size of this dataset, the **first MySQL startup may take some time** while the blocklist is loaded.
+- Google
+- DuckDuckGo
+- Bing
+- Wikipedia
+
+Configurado via banco.
 
 ---
 
-# Language Filter
+## Features
 
-Page language is detected using the Python library:
+- Crawling recursivo com limites configuráveis
+- Pool de workers multi-thread
+- Rate limiting por domínio (cooldown real)
+- Retry com controle temporal
+- Filtro de idioma (`langdetect`)
+- Blocklist eficiente (MD5)
+- Deduplicação por conteúdo
+- Compressão (zstd)
+- Observabilidade completa (traces, metrics, logs)
 
-```
+---
 
-langdetect
+## Configuração
 
-```
+### Ambiente (`.env`)
 
-Only pages matching the allowed languages are processed by the crawler.
-
-To change the accepted languages, edit:
+Definido em:
 
 ```
 
@@ -129,60 +116,34 @@ miner/settings/settings.py
 
 ```
 
-Example:
+Principais:
 
-```
-
-Settings.LANGUAGE_TARGETS
-
-```
-
----
-
-# Requirements
-
-Main runtime requirements:
-
-- Python **3.12**
-- Playwright
-
-Local infrastructure requirements:
-
-- Docker
-- Docker Compose
-
-Python dependencies are listed in:
-
-```
-
-requirements.txt
-
-```
+- `DB_HOST`
+- `DB_PORT`
+- `DB_USER`
+- `DB_PASSWORD`
+- `DB_NAME`
+- `MAX_THREADS`
+- `SAVE_HTML`
 
 ---
 
-# Project Structure
+### Dinâmica (MySQL → tabela `settings`)
 
-```
+Sem necessidade de restart:
 
-.
-├── compose.yml
-├── Dockerfile
-├── miner/              # crawler implementation
-├── mysql_init/         # database schema and initial data
-├── loki/
-├── prometheus/
-├── otel/
-├── requirements.txt
-└── README.md
-
-```
+- `init_terms`
+- `search_engine`
+- `max_recursion`
+- `max_retry_attempts`
+- `domain_request_interval_ms`
+- `system_status`
 
 ---
 
-# Running the Stack
+## Execução
 
-Start the infrastructure services:
+### Infraestrutura
 
 ```
 
@@ -190,51 +151,29 @@ docker compose up -d
 
 ```
 
-This launches:
+Serviços:
 
 - MySQL
 - Grafana
-- Loki
 - Prometheus
+- Loki
 - Jaeger
-- OpenTelemetry Collector
-
-Note:
-
-MySQL initialization may take a few minutes due to the **5M domain blocklist**.
+- OTEL Collector
 
 ---
 
-# Install Python Dependencies
+### Setup
 
 ```
 
 pip install -r requirements.txt
-
-```
-
-Install Playwright browser:
-
-```
-
 playwright install chromium
 
 ```
 
 ---
 
-# Configuration
-
-Configuration is handled through:
-
-- `.env` environment variables
-- the `settings` table in MySQL
-
-This allows runtime configuration without rebuilding the crawler.
-
----
-
-# Running the Crawler
+### Run
 
 ```
 
@@ -242,7 +181,7 @@ python -m miner.main
 
 ```
 
-Reset the database:
+Reset do banco:
 
 ```
 
@@ -252,34 +191,100 @@ python -m miner.main --reset-db
 
 ---
 
-# Data Storage
+## Banco de Dados
 
-All collected data is stored in **MySQL**, including:
+Entidades principais:
 
-- crawled pages
-- extracted text and HTML
-- discovered links
-- domain metadata
-
----
-
-# TODO
-
-- Export crawled data from MySQL
-- Workers with page in `processing` status should peridically refresh the page.updated_at to prevent false release page
+- `pages` → fila + conteúdo
+- `domain` → controle de rate limit
+- `blocked_domain` → blacklist
+- `settings` → config dinâmica
 
 ---
 
-# Disclaimer
+## Concorrência
 
-Generative AI was used to assist code writing in this project.
+- Threads limitadas por `MAX_THREADS`
+- Claim com `FOR UPDATE SKIP LOCKED`
+- Lock distribuído (leader)
+- Cache de IDs para reduzir contenção
 
-# License
+---
 
-See:
+## Observabilidade
+
+OpenTelemetry integrado:
+
+- tracing distribuído
+- métricas customizadas
+- logs centralizados
+
+Stack:
+
+- Grafana → dashboards
+- Prometheus → métricas
+- Loki → logs
+- Jaeger → traces
+
+---
+
+## Regras de Crawling
+
+Uma página só é processada se:
+
+- não excedeu retry
+- está dentro do limite de recursão
+- domínio não está bloqueado
+- domínio não está em cooldown
+
+Caso contrário:
+
+- status atualizado
+- processamento interrompido
+
+---
+
+## Armazenamento
+
+- Texto sempre salvo
+- HTML opcional (`SAVE_HTML`)
+- Compressão com zstd
+- Deduplicação automática (hash)
+
+---
+
+## Estrutura do Projeto
 
 ```
 
-LICENSE.md
+miner/
+mysql_init/
+loki/
+prometheus/
+otel/
+README.md
 
 ```
+
+---
+
+## Limitações
+
+- Sem exportação nativa dos dados
+- Balanceamento por domínio simples
+- Sem priorização de URLs
+
+---
+
+## Roadmap
+
+- Export de dados
+- Melhor scheduler
+- Backoff adaptativo por domínio
+- Heartbeat para páginas em processamento
+
+---
+
+## Licença
+
+Veja: LICENSE.md
