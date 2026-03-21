@@ -55,7 +55,5 @@ class Settings:  # pylint: disable=too-few-public-methods
 
     SECONDS_BETWEEN_UPDATE_SYSTEM_STATUS = 60
 
-    SECONDS_BETWEEN_MOVE_COMPLETE_PAGES = 60
-
 
 settings = Settings()

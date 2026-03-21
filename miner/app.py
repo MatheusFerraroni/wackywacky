@@ -16,7 +16,7 @@ from miner.leader import LeaderElection
 import threading
 from miner.enums import PageStatus
 from contextlib import suppress
-from miner.models import Domain, Page, PageComplete
+from miner.models import Domain, Page
 
 from miner.metrics import (
     metric_pages_released,
@@ -54,7 +54,6 @@ class App:
             'last_system_status_time': None,
             'last_clean_db': datetime.now(),
             'last_log_threads': datetime.now(),
-            'last_move_complete_pages': datetime.now(),
         }
 
     def check_timers_executions(self):
@@ -68,19 +67,6 @@ class App:
         if should_clean_db and self.leader.is_leader:
             self.last_execution_timers['last_clean_db'] = datetime.now()
             self.clean_db()
-
-        should_move_complete_pages = self.last_execution_timers['last_move_complete_pages'] is None
-        if not should_move_complete_pages:
-            total_seconds = (
-                datetime.now() - self.last_execution_timers['last_move_complete_pages']
-            ).total_seconds()
-            if total_seconds > settings.SECONDS_BETWEEN_MOVE_COMPLETE_PAGES:
-                should_move_complete_pages = True
-        if should_move_complete_pages and self.leader.is_leader:
-            self.last_execution_timers['last_move_complete_pages'] = datetime.now()
-            total_moved = PageComplete.transfer_to_complete()
-
-            self.logger.info('Moved %s completed pages', total_moved)
 
         should_log_threads = False
         if not self.last_execution_timers['last_log_threads']:
@@ -103,8 +89,6 @@ class App:
             try:
                 cursor.execute('TRUNCATE TABLE pages')
                 cursor.execute('TRUNCATE TABLE domain')
-                cursor.execute('TRUNCATE TABLE pages_complete')
-                cursor.execute('TRUNCATE TABLE cache_url')
                 cursor.execute(
                     """
                     UPDATE settings

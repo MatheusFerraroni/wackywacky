@@ -2,10 +2,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import random
 import pymysql
-import re
-import threading
-
-import zstandard as zstd
 
 from miner.db import get_connection
 from miner.models.utils import md5_bin16, normalize_url
@@ -13,6 +9,9 @@ from miner.enums.page_status import PageStatus
 from miner.settings.settings_db import SettingsDB
 from miner.settings.settings import settings
 from miner.metrics import metric_pages_marked_as_same_as
+import zstandard as zstd
+import threading
+import re
 
 lock_claim_next = threading.RLock()
 
@@ -21,6 +20,8 @@ _zstd_compressor = zstd.ZstdCompressor(level=_ZSTD_LEVEL)
 _zstd_decompressor = zstd.ZstdDecompressor()
 
 MD5_REGEX = re.compile(r'^[a-fA-F0-9]{32}$')
+
+_claim_next_ids: list[int] = []
 
 
 def _compress_str(value: str | None) -> bytes | None:
@@ -90,9 +91,9 @@ class Page:
             recursion_level=row['recursion_level'],
             status=row['status'],
             retry_count=row['retry_count'],
-            text=_decompress_str(row['text']) if row['text'] is not None else None,
+            text=row['text'],
             text_md5=row['text_md5'],
-            html=_decompress_str(row['html']) if row['html'] is not None else None,
+            html=row['html'],
             html_md5=row['html_md5'],
             created_at=row['created_at'],
             updated_at=row['updated_at'],
@@ -148,56 +149,50 @@ class Page:
     @classmethod
     def get_by_md5(cls, url_md5: bytes) -> 'Page | None':
         conn = get_connection()
-        query = """
-            SELECT
-                id, domain_id, parent_page_id, same_as,
-                url, url_md5,
-                url_final, url_final_md5,
-                status_code, title,
-                recursion_level, status,
-                retry_count,
-                text, text_md5, html, html_md5,
-                created_at, updated_at
-            FROM {table}
-            WHERE url_md5 = %s
-            LIMIT 1
-        """
-
         with conn.cursor() as cur:
-            for table in ('pages', 'pages_complete'):
-                cur.execute(query.format(table=table), (url_md5,))
-                row = cur.fetchone()
-                if row:
-                    return cls.from_db_row(row)
-
-        return None
+            cur.execute(
+                """
+                SELECT
+                    id, domain_id, parent_page_id, same_as,
+                    url, url_md5,
+                    url_final, url_final_md5,
+                    status_code, title,
+                    recursion_level, status,
+                    retry_count,
+                    text, text_md5, html, html_md5,
+                    created_at, updated_at
+                FROM pages
+                WHERE url_md5 = %s
+                LIMIT 1
+                """,
+                (url_md5,),
+            )
+            row = cur.fetchone()
+            return cls.from_db_row(row) if row else None
 
     @classmethod
     def get_by_id(cls, page_id: int) -> 'Page | None':
         conn = get_connection()
-        query = """
-            SELECT
-                id, domain_id, parent_page_id, same_as,
-                url, url_md5,
-                url_final, url_final_md5,
-                status_code, title,
-                recursion_level, status,
-                retry_count,
-                text, text_md5, html, html_md5,
-                created_at, updated_at
-            FROM {table}
-            WHERE id = %s
-            LIMIT 1
-        """
-
         with conn.cursor() as cur:
-            for table in ('pages', 'pages_complete'):
-                cur.execute(query.format(table=table), (page_id,))
-                row = cur.fetchone()
-                if row:
-                    return cls.from_db_row(row)
-
-        return None
+            cur.execute(
+                """
+                SELECT
+                    id, domain_id, parent_page_id, same_as,
+                    url, url_md5,
+                    url_final, url_final_md5,
+                    status_code, title,
+                    recursion_level, status,
+                    retry_count,
+                    text, text_md5, html, html_md5,
+                    created_at, updated_at
+                FROM pages
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (page_id,),
+            )
+            row = cur.fetchone()
+            return cls.from_db_row(row) if row else None
 
     @classmethod
     def get_or_create(
@@ -212,19 +207,19 @@ class Page:
     ) -> 'Page':
         url = cls.normalize_url(url)
         url_md5 = cls.url_to_md5(url)
-        st = status.value if hasattr(status, 'value') else str(status)
 
         existing = cls.get_by_md5(url_md5)
         if existing:
             return existing
 
-        conn = get_connection()
+        st = status.value if hasattr(status, 'value') else str(status)
 
+        conn = get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT IGNORE INTO pages (
+                    INSERT INTO pages (
                         domain_id,
                         parent_page_id,
                         same_as,
@@ -245,36 +240,24 @@ class Page:
                         st,
                     ),
                 )
-
-                new_id = cur.lastrowid if cur.rowcount > 0 else None
-
-                cur.execute(
-                    """
-                    INSERT IGNORE INTO cache_url (url_md5, url)
-                    VALUES (%s, %s)
-                    """,
-                    (url_md5, url),
-                )
+                new_id = cur.lastrowid
 
             conn.commit()
+            return cls.get_by_id(int(new_id))
 
-            if new_id:
-                page = cls.get_by_id(int(new_id))
-                if page:
-                    return page
-
+        except pymysql.err.IntegrityError:
+            conn.rollback()
             existing = cls.get_by_md5(url_md5)
             if existing:
                 return existing
-
-            raise RuntimeError('Falha ao criar ou localizar página após INSERT IGNORE.')
-
+            raise
         except Exception:
             conn.rollback()
             raise
 
     @classmethod
-    def claim_next_todo_url(cls) -> int | None:
+    def claim_next_todo_url(cls) -> str | None:
+        global _claim_next_ids
         domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
         domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
 
@@ -290,38 +273,119 @@ class Page:
         try:
             with conn.cursor() as cur:
                 with lock_claim_next:
-                    cur.execute(
-                        """
-                        SELECT
-                            p.id,
-                            p.url,
-                            d.id AS domain_id
-                        FROM pages p
-                        INNER JOIN domain d
-                            ON d.id = p.domain_id
-                        WHERE
-                            p.recursion_level < %s
-                            AND d.recursion_level < %s
-                            AND p.retry_count < %s
-                            AND (
-                                d.last_request_at IS NULL
-                                OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                            )
-                            AND p.status = %s
-                        LIMIT 20
-                        FOR UPDATE SKIP LOCKED
-                        """,
-                        [
-                            max_recursion_page,
-                            max_recursion,
-                            max_retry_attempts,
-                            domain_cooldown_seconds,
-                            PageStatus.TODO.value,
-                        ],
-                    )
+                    rows = []
 
-                    rows = cur.fetchall()
+                    def build_in_clause(ids: list[int]) -> str:
+                        return ', '.join(['%s'] * len(ids))
 
+                    # -------- First attempt: TODO using cached ids --------
+                    if _claim_next_ids:
+                        in_clause = build_in_clause(_claim_next_ids)
+                        cur.execute(
+                            f"""
+                            SELECT
+                                p.id,
+                                p.url,
+                                d.id AS domain_id
+                            FROM pages p
+                            INNER JOIN domain d
+                                ON d.id = p.domain_id
+                            WHERE
+                                p.id IN ({in_clause})
+                                AND p.recursion_level < %s
+                                AND d.recursion_level < %s
+                                AND p.retry_count < %s
+                                AND (
+                                    d.last_request_at IS NULL
+                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                )
+                                AND p.status = %s
+                            LIMIT 20
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            [
+                                *_claim_next_ids,
+                                max_recursion_page,
+                                max_recursion,
+                                max_retry_attempts,
+                                domain_cooldown_seconds,
+                                PageStatus.TODO.value,
+                            ],
+                        )
+                        rows = cur.fetchall()
+
+                    # -------- Fallback: TODO without cached ids --------
+                    if not rows:
+                        cur.execute(
+                            """
+                            SELECT
+                                p.id,
+                                p.url,
+                                d.id AS domain_id
+                            FROM pages p
+                            INNER JOIN domain d
+                                ON d.id = p.domain_id
+                            WHERE
+                                p.recursion_level < %s
+                                AND d.recursion_level < %s
+                                AND p.retry_count < %s
+                                AND (
+                                    d.last_request_at IS NULL
+                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                )
+                                AND p.status = %s
+                            LIMIT 20
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            [
+                                max_recursion_page,
+                                max_recursion,
+                                max_retry_attempts,
+                                domain_cooldown_seconds,
+                                PageStatus.TODO.value,
+                            ],
+                        )
+                        rows = cur.fetchall()
+
+                    # -------- If no TODO found, try FAILED using cached ids --------
+                    if not rows and _claim_next_ids:
+                        in_clause = build_in_clause(_claim_next_ids)
+                        cur.execute(
+                            f"""
+                            SELECT
+                                p.id,
+                                p.url,
+                                d.id AS domain_id
+                            FROM pages p
+                            INNER JOIN domain d
+                                ON d.id = p.domain_id
+                            WHERE
+                                p.id IN ({in_clause})
+                                AND p.recursion_level < %s
+                                AND d.recursion_level < %s
+                                AND p.retry_count < %s
+                                AND (
+                                    d.last_request_at IS NULL
+                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                                )
+                                AND p.status = %s
+                                AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                            LIMIT 20
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            [
+                                *_claim_next_ids,
+                                max_recursion_page,
+                                max_recursion,
+                                max_retry_attempts,
+                                domain_cooldown_seconds,
+                                PageStatus.FAILED.value,
+                                retry_interval_seconds,
+                            ],
+                        )
+                        rows = cur.fetchall()
+
+                    # -------- Fallback: FAILED without cached ids --------
                     if not rows:
                         cur.execute(
                             """
@@ -354,14 +418,22 @@ class Page:
                                 retry_interval_seconds,
                             ],
                         )
-
                         rows = cur.fetchall()
 
                     if not rows:
+                        _claim_next_ids = []
                         conn.rollback()
                         return None
 
+                    # always refresh cached ids with currently available rows
+                    _claim_next_ids = [row['id'] for row in rows]
+
                     row = random.choice(rows)
+
+                    # remove claimed id from cache
+                    _claim_next_ids = [
+                        page_id for page_id in _claim_next_ids if page_id != row['id']
+                    ]
 
                     cur.execute(
                         """
@@ -382,11 +454,51 @@ class Page:
                     )
 
                 conn.commit()
-                return int(row['id'])
+                return row['id']
 
         except Exception:
             conn.rollback()
             raise
+
+    @classmethod
+    def get_id_by_text_or_html_md5(
+        cls,
+        *,
+        text_md5: bytes | None = None,
+        html_md5: bytes | None = None,
+        exclude_id: int | None = None,
+    ) -> int | None:
+        if not text_md5 and not html_md5:
+            return None
+
+        conn = get_connection()
+        with conn.cursor() as cur:
+            clauses: list[str] = []
+            params: list[object] = []
+
+            if text_md5 is not None:
+                clauses.append('text_md5 = %s')
+                params.append(text_md5)
+
+            if html_md5 is not None and settings.SAVE_HTML:
+                clauses.append('html_md5 = %s')
+                params.append(html_md5)
+
+            sql = f"""
+                SELECT id
+                FROM pages
+                WHERE ({' OR '.join(clauses)})
+            """
+
+            if exclude_id is not None:
+                sql += ' AND id <> %s'
+                params.append(exclude_id)
+
+            sql += ' ORDER BY id ASC LIMIT 1'
+
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return int(row['id']) if row else None
 
     def update(
         self,
@@ -465,6 +577,7 @@ class Page:
             params.append(new_text_md5)
 
         if html is not None and settings.SAVE_HTML:
+            html = html[: settings.MAX_CHARACTERS_TEXT]
             new_html_md5 = self.url_to_md5(html)
             sets.append('html = %s')
             params.append(_compress_str(html))
@@ -542,6 +655,10 @@ class Page:
 
     @classmethod
     def release_stucked_processing(cls, older_than_seconds: int = 60) -> int:
+        """
+        Move pages com status PROCESSING e updated_at mais antigo que X segundos de volta para TODO.
+        Retorna a quantidade de registros afetados.
+        """
         conn = get_connection()
         try:
             with conn.cursor() as cur:
@@ -568,46 +685,6 @@ class Page:
             raise
 
     @classmethod
-    def get_id_by_text_or_html_md5(
-        cls,
-        *,
-        text_md5: bytes | None = None,
-        html_md5: bytes | None = None,
-        exclude_id: int | None = None,
-    ) -> int | None:
-        if not text_md5 and not html_md5:
-            return None
-
-        conn = get_connection()
-        with conn.cursor() as cur:
-            clauses: list[str] = []
-            params: list[object] = []
-
-            if text_md5 is not None:
-                clauses.append('text_md5 = %s')
-                params.append(text_md5)
-
-            if html_md5 is not None and settings.SAVE_HTML:
-                clauses.append('html_md5 = %s')
-                params.append(html_md5)
-
-            sql = f"""
-                SELECT id
-                FROM pages
-                WHERE ({' OR '.join(clauses)})
-            """
-
-            if exclude_id is not None:
-                sql += ' AND id <> %s'
-                params.append(exclude_id)
-
-            sql += ' ORDER BY id ASC LIMIT 1'
-
-            cur.execute(sql, params)
-            row = cur.fetchone()
-            return int(row['id']) if row else None
-
-    @classmethod
     def bulk_insert_ignore(cls, rows: list[dict]) -> int:
         if not rows:
             return 0
@@ -615,10 +692,9 @@ class Page:
         conn = get_connection()
         batch_size = 1000
         total_affected = 0
-        seen: set[bytes] = set()
 
+        seen: set[tuple[int, str]] = set()
         prepared_rows: list[tuple] = []
-        cache_rows: list[tuple[bytes, str]] = []
 
         for row in rows:
             raw_url = row['url']
@@ -629,9 +705,6 @@ class Page:
                 continue
             seen.add(url_md5)
 
-            status = row['status']
-            st = status.value if hasattr(status, 'value') else str(status)
-
             prepared_rows.append(
                 (
                     row['domain_id'],
@@ -640,16 +713,14 @@ class Page:
                     normalized_url,
                     url_md5,
                     row['recursion_level'],
-                    st,
+                    row['status'],
                 )
             )
-
-            cache_rows.append((url_md5, normalized_url))
 
         if not prepared_rows:
             return 0
 
-        pages_sql_base = """
+        base_sql = """
             INSERT IGNORE INTO pages (
                 domain_id,
                 parent_page_id,
@@ -662,77 +733,19 @@ class Page:
             VALUES {values_sql}
         """
 
-        cache_sql_base = """
-            INSERT IGNORE INTO cache_url (
-                url_md5,
-                url
-            )
-            VALUES {values_sql}
-        """
+        with conn.cursor() as cur:
+            for i in range(0, len(prepared_rows), batch_size):
+                batch = prepared_rows[i : i + batch_size]
 
-        existing_sql_base = """
-            SELECT url_md5
-            FROM pages
-            WHERE url_md5 IN ({placeholders})
-            UNION
-            SELECT url_md5
-            FROM pages_complete
-            WHERE url_md5 IN ({placeholders})
-        """
+                values_sql = ', '.join(['(%s, %s, %s, %s, %s, %s, %s)'] * len(batch))
+                sql = base_sql.format(values_sql=values_sql)
 
-        try:
-            with conn.cursor() as cur:
-                for i in range(0, len(prepared_rows), batch_size):
-                    batch_pages = prepared_rows[i : i + batch_size]
-                    batch_cache = cache_rows[i : i + batch_size]
+                params = []
+                for item in batch:
+                    params.extend(item)
 
-                    md5_list = [item[4] for item in batch_pages]
-                    placeholders = ', '.join(['%s'] * len(md5_list))
-                    existing_sql = existing_sql_base.format(placeholders=placeholders)
+                cur.execute(sql, params)
+                total_affected += cur.rowcount
 
-                    cur.execute(existing_sql, [*md5_list, *md5_list])
-                    existing_rows = cur.fetchall()
-                    existing_md5s = {
-                        row['url_md5'] if isinstance(row, dict) else row[0] for row in existing_rows
-                    }
-
-                    pages_to_insert = []
-                    cache_to_insert = []
-
-                    for page_item, cache_item in zip(batch_pages, batch_cache):
-                        page_url_md5 = page_item[4]
-                        if page_url_md5 in existing_md5s:
-                            continue
-
-                        pages_to_insert.append(page_item)
-                        cache_to_insert.append(cache_item)
-
-                    if pages_to_insert:
-                        pages_values_sql = ', '.join(
-                            ['(%s, %s, %s, %s, %s, %s, %s)'] * len(pages_to_insert)
-                        )
-                        pages_sql = pages_sql_base.format(values_sql=pages_values_sql)
-
-                        pages_params = []
-                        for item in pages_to_insert:
-                            pages_params.extend(item)
-
-                        cur.execute(pages_sql, pages_params)
-                        total_affected += cur.rowcount
-
-                    if batch_cache:
-                        cache_values_sql = ', '.join(['(%s, %s)'] * len(batch_cache))
-                        cache_sql = cache_sql_base.format(values_sql=cache_values_sql)
-
-                        cache_params = []
-                        for item in batch_cache:
-                            cache_params.extend(item)
-
-                        cur.execute(cache_sql, cache_params)
-
-            conn.commit()
-            return int(total_affected)
-
-        except Exception:
-            conn.rollback()
-            raise
+        conn.commit()
+        return total_affected

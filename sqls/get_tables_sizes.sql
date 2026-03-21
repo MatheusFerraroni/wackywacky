@@ -1,11 +1,11 @@
 -- Refresh stale tables
--- SELECT CONCAT(
---     'ANALYZE TABLE ',
---     GROUP_CONCAT(CONCAT('`', table_schema, '`.`', table_name, '`') SEPARATOR ', '),
---     ';'
--- ) AS analyze_sql
--- FROM information_schema.TABLES
--- WHERE table_schema = 'appdb';
+SELECT CONCAT(
+    'ANALYZE TABLE ',
+    GROUP_CONCAT(CONCAT('`', table_schema, '`.`', table_name, '`') SEPARATOR ', '),
+    ';'
+) AS analyze_sql
+FROM information_schema.TABLES
+WHERE table_schema = 'appdb';
 
 SELECT
     table_schema AS database_name,
