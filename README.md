@@ -1,6 +1,8 @@
 
 # WackyWacky
 
+![Banner WackyWacky](assets/banner.png)
+
 Crawler web experimental, distribuído e observável, projetado para exploração controlada da web com foco em robustez, controle de carga e rastreabilidade.
 
 ---
