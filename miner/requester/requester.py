@@ -179,7 +179,7 @@ class Requester:
 
             self.logging_timers(duration)
         except Exception as e:
-            self.error(f'Uncaught exception: {str(e)}')
+            self._log_error(f'Uncaught exception: {str(e)}')
         finally:
             return ret
 

@@ -301,7 +301,6 @@ class Page:
                                 )
                                 AND p.status = %s
                             LIMIT 20
-                            FOR UPDATE SKIP LOCKED
                             """,
                             [
                                 *_claim_next_ids,
@@ -335,7 +334,6 @@ class Page:
                                 )
                                 AND p.status = %s
                             LIMIT 20
-                            FOR UPDATE SKIP LOCKED
                             """,
                             [
                                 max_recursion_page,
@@ -371,7 +369,6 @@ class Page:
                                 AND p.status = %s
                                 AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
                             LIMIT 20
-                            FOR UPDATE SKIP LOCKED
                             """,
                             [
                                 *_claim_next_ids,
@@ -407,7 +404,6 @@ class Page:
                                 AND p.status = %s
                                 AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
                             LIMIT 20
-                            FOR UPDATE SKIP LOCKED
                             """,
                             [
                                 max_recursion_page,
