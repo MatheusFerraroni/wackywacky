@@ -1,12 +1,19 @@
-from miner.db import get_connection
+"""Database-backed runtime settings cache."""
+
 import json
+
+from miner.db import get_connection
 
 
 class SettingsDB:  # pylint: disable=too-few-public-methods
+    """Read JSON settings from the database with a small local cache."""
+
     def __init__(self):
+        """Initialize the settings cache."""
         self.configs = {}
 
     def get_config(self, config_name: str, refresh: bool = False):
+        """Return a configuration value by name."""
         if not refresh and config_name in self.configs:
             return self.configs[config_name]
 

@@ -18,7 +18,8 @@ O WackyWacky executa crawling recursivo a partir de queries iniciais, aplicando:
 - bloqueio de domínios
 - deduplicação por conteúdo
 
-O sistema é multi-worker, coordenado via banco (MySQL), e totalmente instrumentado com OpenTelemetry.
+O sistema é multi-worker e coordenado via banco (MySQL).
+A telemetria via OpenTelemetry é opcional: no Compose atual ela fica desligada por padrão e a stack de observabilidade está comentada.
 
 ---
 
@@ -31,7 +32,7 @@ Leader (1)
 
 Workers (N)
 └── consomem páginas
-└── executam crawling com Playwright
+└── executam crawling com Playwright via Chromium ou Obscura/CDP
 
 ```
 
@@ -68,7 +69,7 @@ Orquestrador:
 ### `Requester`
 Core do crawler:
 
-- navegação via Playwright
+- navegação via Playwright conectado a Chromium ou Obscura/CDP
 - extração de conteúdo
 - aplicação de regras
 - persistência
@@ -77,7 +78,7 @@ Core do crawler:
 Modelo de dados:
 
 - controle de status e retry
-- limitação por domínio
+- limitação por domínio com precisão subsegundo
 - deduplicação por hash
 
 ### `Starter`
@@ -102,7 +103,7 @@ Configurado via banco.
 - Blocklist eficiente (MD5)
 - Deduplicação por conteúdo
 - Compressão (zstd)
-- Observabilidade completa (traces, metrics, logs)
+- Observabilidade opcional (traces, metrics, logs)
 
 ---
 
@@ -126,7 +127,14 @@ Principais:
 - `DB_PASSWORD`
 - `DB_NAME`
 - `MAX_THREADS`
+- `PROCESSING_TIMEOUT_SECONDS`
+- `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS`
+- `BROWSER_BACKEND`
+- `OBSCURA_CDP_ENDPOINT`
+- `OBSCURA_CDP_CONNECT_TIMEOUT_SECONDS`
+- `MINER_TELEMETRY_ENABLED`
 - `SAVE_HTML`
+- `MAX_CHARACTERS_TEXT`
 
 ---
 
@@ -138,8 +146,11 @@ Sem necessidade de restart:
 - `search_engine`
 - `max_recursion`
 - `max_retry_attempts`
+- `retry_interval_ms`
 - `domain_request_interval_ms`
 - `system_status`
+
+`domain_request_interval_ms` é respeitado em milissegundos usando `TIMESTAMP(6)` em `domain.last_request_at`.
 
 ---
 
@@ -156,6 +167,15 @@ docker compose up -d
 Serviços:
 
 - MySQL
+- Obscura
+- Workers
+- phpMyAdmin
+
+O `compose.yml` atual define 11 pares `obscura-N`/`worker-N`, de `1` a `11`.
+Cada worker usa `MAX_THREADS=1` e aponta para seu Obscura dedicado via `OBSCURA_CDP_ENDPOINT`.
+
+Serviços de observabilidade estão no arquivo, mas comentados por padrão:
+
 - Grafana
 - Prometheus
 - Loki
@@ -169,6 +189,8 @@ Serviços:
 ```
 
 pip install -r requirements.txt
+
+# somente para uso local com BROWSER_BACKEND=chromium
 playwright install chromium
 
 ```
@@ -191,6 +213,18 @@ python -m miner.main --reset-db
 
 ```
 
+Scripts utilitários:
+
+```
+
+# limpa pages/domain, libera lock de líder e restaura system_status=starting
+python reset_db.py
+
+# imprime previews de textos salvos em pages.text
+python preview_page_text.py
+
+```
+
 ---
 
 ## Banco de Dados
@@ -202,14 +236,34 @@ Entidades principais:
 - `blocked_domain` → blacklist
 - `settings` → config dinâmica
 
+Detalhes relevantes:
+
+- `domain.last_request_at` usa `TIMESTAMP(6)` para cooldown subsegundo
+- `pages.text` e `pages.html` usam `MEDIUMBLOB`
+- `pages.text` é salvo comprimido com zstd
+- `pages.html` só é salvo quando `SAVE_HTML=True`
+
+Migrações manuais para produção ficam em `sqls/`, incluindo:
+
+```
+
+sqls/alter_pages_content_mediumblob.sql
+sqls/alter_domain_cooldown_timestamp6.sql
+
+```
+
+Essas migrações precisam ser aplicadas em bancos já existentes. O `mysql_init/` só afeta bancos criados do zero.
+
 ---
 
 ## Concorrência
 
 - Threads limitadas por `MAX_THREADS`
-- Claim com `FOR UPDATE SKIP LOCKED`
+- Claim em batch de 20 com `FOR UPDATE SKIP LOCKED`
+- Cada batch reserva no máximo uma página por domínio
 - Lock distribuído (leader)
 - Cache de IDs para reduzir contenção
+- Lease de páginas `processing` controlado por `PROCESSING_TIMEOUT_SECONDS`
 
 ---
 
@@ -221,7 +275,13 @@ OpenTelemetry integrado:
 - métricas customizadas
 - logs centralizados
 
-Stack:
+Controle via ambiente:
+
+- `MINER_TELEMETRY_ENABLED=true` envia traces, métricas e logs para OTLP
+- `MINER_TELEMETRY_ENABLED=false` mantém logs no stdout e desliga o report OpenTelemetry do miner
+- A flag não inicia nem para Grafana, Prometheus, Loki, Jaeger ou OTEL Collector
+
+Stack disponível no Compose, comentada por padrão:
 
 - Grafana → dashboards
 - Prometheus → métricas
@@ -261,9 +321,12 @@ Caso contrário:
 
 miner/
 mysql_init/
+sqls/
 loki/
 prometheus/
 otel/
+reset_db.py
+preview_page_text.py
 README.md
 
 ```
@@ -273,7 +336,7 @@ README.md
 ## Limitações
 
 - Sem exportação nativa dos dados
-- Balanceamento por domínio simples
+- Balanceamento por domínio ainda é baseado em claim + cooldown, não em fila dedicada
 - Sem priorização de URLs
 
 ---
@@ -281,9 +344,10 @@ README.md
 ## Roadmap
 
 - Export de dados
-- Melhor scheduler
-- Backoff adaptativo por domínio
 - Heartbeat para páginas em processamento
+- Add queue mechanism to reduce DB workload (Redis?)
+- Melhorar deduplicação por conteúdo fazendo uma normalização mais eficiente
+- Adicionar referência ao https://dsi.ut-capitole.fr/blacklists/index_en.php
 
 ---
 

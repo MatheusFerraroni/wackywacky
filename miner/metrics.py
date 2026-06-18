@@ -1,3 +1,5 @@
+"""OpenTelemetry metric instruments used by the miner."""
+
 from opentelemetry import metrics
 
 meter = metrics.get_meter('miner')

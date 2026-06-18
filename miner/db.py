@@ -1,7 +1,11 @@
+"""Thread-local MySQL connection helpers."""
+
 import logging
 import threading
 import time
+
 import pymysql
+
 from miner.settings.settings import settings
 
 logger = logging.getLogger('db')
@@ -47,17 +51,18 @@ def _create_connection(max_wait_seconds=150, retry_interval=2):
 
 
 def get_connection():
+    """Return a live thread-local MySQL connection."""
     conn = getattr(_thread_local, 'connection', None)
 
     if conn is not None:
         try:
             conn.ping(reconnect=True)
             return conn
-        except Exception:
+        except pymysql.MySQLError:
             logger.warning('Thread DB connection lost. Reconnecting...')
             try:
                 conn.close()
-            except Exception:
+            except pymysql.MySQLError:
                 pass
 
     conn = _create_connection()
@@ -66,6 +71,7 @@ def get_connection():
 
 
 def close_connection():
+    """Close the current thread-local connection, if any."""
     conn = getattr(_thread_local, 'connection', None)
     if conn is not None:
         try:
@@ -75,6 +81,7 @@ def close_connection():
 
 
 def test_connection():
+    """Run a simple query to verify database connectivity."""
     conn = get_connection()
     with conn.cursor() as cursor:
         cursor.execute('SELECT 1 as test')

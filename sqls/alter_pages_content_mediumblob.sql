@@ -1,0 +1,5 @@
+ALTER TABLE pages
+    MODIFY COLUMN `text` MEDIUMBLOB NULL,
+    MODIFY COLUMN `html` MEDIUMBLOB NULL;
+
+SHOW COLUMNS FROM pages WHERE Field IN ('text', 'html');

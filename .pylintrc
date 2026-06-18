@@ -1,0 +1,9 @@
+[MAIN]
+persistent=no
+
+[FORMAT]
+max-line-length=100
+
+[MESSAGES CONTROL]
+disable=
+    duplicate-code

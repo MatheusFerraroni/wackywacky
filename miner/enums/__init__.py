@@ -1,3 +1,5 @@
+"""Public miner enums."""
+
 from .page_status import PageStatus
 from .system_status import SystemStatus
 

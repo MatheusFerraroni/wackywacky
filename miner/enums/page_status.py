@@ -1,7 +1,11 @@
+"""Page status enum."""
+
 from enum import Enum
 
 
 class PageStatus(Enum):
+    """Possible lifecycle states for a crawled page."""
+
     TODO = 'todo'
     PROCESSING = 'processing'
     DONE = 'done'

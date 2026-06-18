@@ -1,13 +1,19 @@
+"""Domain model and persistence helpers."""
+
 from dataclasses import dataclass
 from datetime import datetime
-from miner.db import get_connection
-from miner.models.utils import md5_bin16, extract_hostname
+
 import pymysql
+
+from miner.db import get_connection
+from miner.models.utils import extract_hostname, md5_bin16
 from miner.settings.settings_db import SettingsDB
 
 
 @dataclass
-class Domain:
+class Domain:  # pylint: disable=too-many-instance-attributes
+    """Persisted crawl domain."""
+
     id: int | None
     url: str
     url_md5: bytes
@@ -22,6 +28,7 @@ class Domain:
 
     @classmethod
     def get_by_md5(cls, url_md5: bytes) -> 'Domain | None':
+        """Load a domain by MD5 digest."""
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -47,6 +54,7 @@ class Domain:
 
     @classmethod
     def get_or_create(cls, any_url: str, parent_pager=None) -> 'Domain':
+        """Return an existing domain or create it from a URL."""
 
         dom = extract_hostname(any_url)
         dom_md5 = md5_bin16(dom)
@@ -87,6 +95,7 @@ class Domain:
 
     @classmethod
     def get_by_id(cls, domain_id: int) -> 'Domain | None':
+        """Load a domain by primary key."""
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -111,8 +120,9 @@ class Domain:
             return cls(**row) if row else None
 
     def try_register_request(self) -> bool:
-        domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
-        domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
+        """Atomically register a request if the domain cooldown has elapsed."""
+        domain_cooldown_ms = int(SettingsDB().get_config('domain_request_interval_ms'))
+        domain_cooldown_us = domain_cooldown_ms * 1000
         conn = get_connection()
         try:
             with conn.cursor() as cur:
@@ -120,15 +130,17 @@ class Domain:
                     """
                     UPDATE domain
                     SET request_count = request_count + 1,
-                        last_request_at = NOW(),
-                        updated_at = NOW()
+                        last_request_at = CURRENT_TIMESTAMP(6),
+                        updated_at = CURRENT_TIMESTAMP(6)
                     WHERE id = %s
                       AND (
                             last_request_at IS NULL
-                            OR last_request_at <= (NOW() - INTERVAL %s SECOND)
+                            OR last_request_at <= (
+                                CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND
+                            )
                       )
                     """,
-                    (self.id, int(domain_cooldown_seconds)),
+                    (self.id, domain_cooldown_us),
                 )
                 affected = cur.rowcount
 
@@ -150,10 +162,12 @@ class Domain:
 
     @classmethod
     def extract_hostname(cls, url):
+        """Extract a normalized hostname from a URL."""
         return extract_hostname(url)
 
     @classmethod
     def bulk_get_or_create(cls, urls: list[str], parent_domain) -> dict[str, 'Domain']:
+        """Bulk create missing domains and return them indexed by hostname."""
         conn = get_connection()
 
         extracted_hosts = [extract_hostname(url) for url in urls]

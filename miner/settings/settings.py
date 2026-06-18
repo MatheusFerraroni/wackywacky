@@ -1,10 +1,10 @@
 """Application configuration and environment variable loading."""
 
-import os
 import logging
+import os
 from pathlib import Path
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 
 logger = logging.getLogger('config')
 
@@ -20,6 +20,15 @@ else:
     logger.info('.env file not found, using system environment variables')
 
 
+def env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    return raw.strip().lower() in {'true', '1', 'yes', 'on'}
+
+
 class Settings:  # pylint: disable=too-few-public-methods
     """Central configuration loaded from environment variables."""
 
@@ -31,10 +40,20 @@ class Settings:  # pylint: disable=too-few-public-methods
     DATABASE_URL = os.getenv('DATABASE_URL', 'mysql+pymysql://appuser:apppass@mysql:3306/appdb')
 
     SECONDS_BETWEEN_CLEAN_DB = int(os.getenv('SECONDS_BETWEEN_CLEAN_DB', '60'))
+    PROCESSING_TIMEOUT_SECONDS = int(os.getenv('PROCESSING_TIMEOUT_SECONDS', '900'))
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = int(
+        os.getenv('GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS', '30')
+    )
+    BROWSER_BACKEND = os.getenv('BROWSER_BACKEND', 'obscura').lower()
+    OBSCURA_CDP_ENDPOINT = os.getenv('OBSCURA_CDP_ENDPOINT', 'http://localhost:9222')
+    OBSCURA_CDP_CONNECT_TIMEOUT_SECONDS = int(
+        os.getenv('OBSCURA_CDP_CONNECT_TIMEOUT_SECONDS', '60')
+    )
 
     OTEL_SERVICE_NAME = os.getenv('OTEL_SERVICE_NAME', 'miner')
     OTEL_SERVICE_VERSION = os.getenv('OTEL_SERVICE_VERSION', '1.0.0')
     OTEL_ENV = os.getenv('OTEL_ENV', 'dev')
+    MINER_TELEMETRY_ENABLED = env_bool('MINER_TELEMETRY_ENABLED', True)
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = os.getenv(
         'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', 'http://localhost:4318'
     )

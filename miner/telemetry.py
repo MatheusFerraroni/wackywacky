@@ -1,33 +1,34 @@
+"""OpenTelemetry setup for traces, metrics, and logs."""
+
 import logging
 from typing import Optional
 
-from opentelemetry import trace, metrics
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry import metrics, trace
 from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.pymysql import PyMySQLInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-
 from miner.settings.settings import Settings
 
-
-_requests_instrumented = False
-_pymysql_instrumented = False
-_logging_instrumented = False
-_telemetry_initialized = False
+_REQUESTS_INSTRUMENTED = False
+_PYMYSQL_INSTRUMENTED = False
+_LOGGING_INSTRUMENTED = False
+_TELEMETRY_INITIALIZED = False
 
 
 def _build_resource() -> Resource:
+    """Build the common OpenTelemetry resource."""
     return Resource.create(
         {
             'service.name': Settings.OTEL_SERVICE_NAME,
@@ -38,6 +39,7 @@ def _build_resource() -> Resource:
 
 
 def _normalize_endpoint(base_or_signal_endpoint: Optional[str], signal_path: str) -> str:
+    """Normalize an OTLP endpoint to the requested signal path."""
     if not base_or_signal_endpoint:
         raise ValueError(f'Missing OTLP endpoint for {signal_path}')
 
@@ -53,13 +55,20 @@ def _normalize_endpoint(base_or_signal_endpoint: Optional[str], signal_path: str
     return f'{endpoint}/{signal_path.lstrip("/")}'
 
 
-def setup_telemetry() -> None:
-    global _requests_instrumented
-    global _pymysql_instrumented
-    global _logging_instrumented
-    global _telemetry_initialized
+def setup_telemetry() -> None:  # pylint: disable=global-statement
+    """Initialize OpenTelemetry exporters and instrumentations once."""
+    # pylint: disable=global-statement
+    global _REQUESTS_INSTRUMENTED
+    global _PYMYSQL_INSTRUMENTED
+    global _LOGGING_INSTRUMENTED
+    global _TELEMETRY_INITIALIZED
 
-    if _telemetry_initialized:
+    if _TELEMETRY_INITIALIZED:
+        return
+
+    if not Settings.MINER_TELEMETRY_ENABLED:
+        _TELEMETRY_INITIALIZED = True
+        logging.getLogger(__name__).info('Miner telemetry disabled by MINER_TELEMETRY_ENABLED')
         return
 
     resource = _build_resource()
@@ -112,16 +121,16 @@ def setup_telemetry() -> None:
     root_logger = logging.getLogger()
     root_logger.addHandler(otel_handler)
 
-    if not _logging_instrumented:
+    if not _LOGGING_INSTRUMENTED:
         LoggingInstrumentor().instrument(set_logging_format=True)
-        _logging_instrumented = True
+        _LOGGING_INSTRUMENTED = True
 
-    if not _pymysql_instrumented:
+    if not _PYMYSQL_INSTRUMENTED:
         PyMySQLInstrumentor().instrument()
-        _pymysql_instrumented = True
+        _PYMYSQL_INSTRUMENTED = True
 
-    if not _requests_instrumented:
+    if not _REQUESTS_INSTRUMENTED:
         RequestsInstrumentor().instrument()
-        _requests_instrumented = True
+        _REQUESTS_INSTRUMENTED = True
 
-    _telemetry_initialized = True
+    _TELEMETRY_INITIALIZED = True

@@ -10,10 +10,10 @@ CREATE TABLE `domain` (
   `recursion_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,
 
   `request_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `last_request_at` TIMESTAMP NULL DEFAULT NULL,
+  `last_request_at` TIMESTAMP(6) NULL DEFAULT NULL,
 
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
 
   UNIQUE KEY `uq_domain_url_md5` (`url_md5`),
 
@@ -62,8 +62,8 @@ CREATE TABLE `pages` (
 
   `retry_count` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
 
-  `text` BLOB NULL,
-  `html` BLOB NULL,
+  `text` MEDIUMBLOB NULL,
+  `html` MEDIUMBLOB NULL,
   `text_md5` BINARY(16) NULL,
   `html_md5` BINARY(16) NULL,
 
@@ -160,12 +160,12 @@ INSERT INTO `settings` (`key`, `value`, `description`) VALUES
   ),
   (
     'retry_interval_ms',
-    JSON_EXTRACT('60000', '$'),
+    JSON_EXTRACT('250', '$'),
     'Interval between retries in milliseconds'
   ),
   (
     'domain_request_interval_ms',
-    JSON_EXTRACT('5000', '$'),
+    JSON_EXTRACT('250', '$'),
     'Interval between request to the same domain in milliseconds'
   ),
   (

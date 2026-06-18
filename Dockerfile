@@ -1,8 +1,7 @@
 FROM python:3.12.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
@@ -15,14 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium for Playwright in a shared location
-RUN python -m playwright install --with-deps chromium
-
 COPY . /app
 
 RUN useradd -m -u 10001 appuser \
-    && mkdir -p /ms-playwright \
-    && chown -R appuser:appuser /app /ms-playwright
+    && chown -R appuser:appuser /app
 
 USER appuser
 

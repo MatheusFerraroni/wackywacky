@@ -1,43 +1,79 @@
+"""Page model and persistence helpers."""
+
+import threading
 from dataclasses import dataclass
 from datetime import datetime
-import random
+
 import pymysql
+import zstandard as zstd
 
 from miner.db import get_connection
-from miner.models.utils import md5_bin16, normalize_url
 from miner.enums.page_status import PageStatus
-from miner.settings.settings_db import SettingsDB
-from miner.settings.settings import settings
 from miner.metrics import metric_pages_marked_as_same_as
-import zstandard as zstd
-import threading
-import re
+from miner.models.utils import md5_bin16, normalize_url
+from miner.settings.settings import settings
+from miner.settings.settings_db import SettingsDB
 
 lock_claim_next = threading.RLock()
+CLAIM_BATCH_SIZE = 20
 
 _ZSTD_LEVEL = 11
+_MYSQL_MEDIUMBLOB_MAX_BYTES = 16_777_215
+_TITLE_MAX_CHARACTERS = 512
 _zstd_compressor = zstd.ZstdCompressor(level=_ZSTD_LEVEL)
 _zstd_decompressor = zstd.ZstdDecompressor()
-
-MD5_REGEX = re.compile(r'^[a-fA-F0-9]{32}$')
 
 _claim_next_ids: list[int] = []
 
 
 def _compress_str(value: str | None) -> bytes | None:
+    """Compress a string for storage."""
     if value is None:
         return None
     return _zstd_compressor.compress(value.encode('utf-8'))
 
 
+def _prepare_content_for_storage(value: str) -> tuple[str, bytes]:
+    """Return content and compressed bytes that fit the configured DB column."""
+    value = value[: settings.MAX_CHARACTERS_TEXT]
+    compressed = _compress_str(value)
+    if compressed is None:
+        return value, b''
+
+    if len(compressed) <= _MYSQL_MEDIUMBLOB_MAX_BYTES:
+        return value, compressed
+
+    low = 0
+    high = len(value)
+    best_value = ''
+    best_compressed = b''
+
+    while low <= high:
+        mid = (low + high) // 2
+        candidate_value = value[:mid]
+        candidate_compressed = _compress_str(candidate_value) or b''
+
+        if len(candidate_compressed) <= _MYSQL_MEDIUMBLOB_MAX_BYTES:
+            best_value = candidate_value
+            best_compressed = candidate_compressed
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return best_value, best_compressed
+
+
 def _decompress_str(value: bytes | None) -> str | None:
+    """Decompress a stored string."""
     if value is None:
         return None
     return _zstd_decompressor.decompress(value).decode('utf-8')
 
 
 @dataclass
-class Page:
+class Page:  # pylint: disable=too-many-instance-attributes
+    """Persisted crawl page."""
+
     id: int | None
     domain_id: int | None
     parent_page_id: int | None
@@ -66,17 +102,20 @@ class Page:
     updated_at: datetime | None = None
 
     @classmethod
-    def url_to_md5(cls, url):
-        if type(url) is not str or bool(MD5_REGEX.fullmatch(url)):
-            return url
+    def url_to_md5(cls, url: str) -> bytes:
+        """Return the 16-byte MD5 digest for a normalized URL."""
+        if not isinstance(url, str):
+            raise TypeError('URL must be a string')
         return md5_bin16(cls.normalize_url(url))
 
     @classmethod
     def normalize_url(cls, url):
+        """Normalize a URL for storage."""
         return normalize_url(url)
 
     @classmethod
     def from_db_row(cls, row: dict) -> 'Page':
+        """Build a Page from a database row."""
         return cls(
             id=row['id'],
             domain_id=row['domain_id'],
@@ -106,6 +145,7 @@ class Page:
         recursion_level: int = 0,
         status: PageStatus = PageStatus.TODO,
     ) -> 'Page':
+        """Build a new unsaved Page from a URL."""
         url = cls.normalize_url(url)
         st = status.value if hasattr(status, 'value') else str(status)
         return cls(
@@ -131,23 +171,27 @@ class Page:
         )
 
     def set_url_final(self, url_final: str | None) -> None:
+        """Set the final normalized URL and its digest."""
         self.url_final = self.normalize_url(url_final) if url_final else None
         self.url_final_md5 = self.url_to_md5(self.url_final) if self.url_final else None
 
     def set_text(self, text: str | None) -> None:
+        """Set page text respecting the configured size limit."""
         if text is None:
             return
-        self.text = text[: settings.MAX_CHARACTERS_TEXT]
-        self.text_md5 = self.url_to_md5(self.text) if self.text else None
+        self.text, _ = _prepare_content_for_storage(text)
+        self.text_md5 = md5_bin16(self.text) if self.text else None
 
     def set_html(self, html: str | None) -> None:
+        """Set page HTML when HTML persistence is enabled."""
         if not settings.SAVE_HTML:
             return
-        self.html = html
-        self.html_md5 = self.url_to_md5(html) if html else None
+        self.html, _ = _prepare_content_for_storage(html)
+        self.html_md5 = md5_bin16(self.html) if self.html else None
 
     @classmethod
     def get_by_md5(cls, url_md5: bytes) -> 'Page | None':
+        """Load a page by URL MD5 digest."""
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -172,6 +216,7 @@ class Page:
 
     @classmethod
     def get_by_id(cls, page_id: int) -> 'Page | None':
+        """Load a page by primary key."""
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
@@ -195,6 +240,7 @@ class Page:
             return cls.from_db_row(row) if row else None
 
     @classmethod
+    # pylint: disable-next=too-many-arguments
     def get_or_create(
         cls,
         *,
@@ -205,6 +251,7 @@ class Page:
         recursion_level: int = 0,
         status: PageStatus = PageStatus.TODO,
     ) -> 'Page':
+        """Return an existing page or create it."""
         url = cls.normalize_url(url)
         url_md5 = cls.url_to_md5(url)
 
@@ -256,204 +303,150 @@ class Page:
             raise
 
     @classmethod
-    def claim_next_todo_url(cls) -> str | None:
+    # pylint: disable-next=too-many-locals
+    def claim_next_todo_url(
+        cls,
+    ) -> int | None:
+        """Claim the next eligible page id for this process."""
+        # pylint: disable=global-statement
         global _claim_next_ids
-        domain_cooldown_ms = SettingsDB().get_config('domain_request_interval_ms')
-        domain_cooldown_seconds = int(domain_cooldown_ms / 1000)
-
-        retry_interval_ms = SettingsDB().get_config('retry_interval_ms')
-        retry_interval_seconds = int(retry_interval_ms / 1000)
-
-        conn = get_connection()
-
-        max_recursion = SettingsDB().get_config('max_recursion')
-        max_recursion_page = SettingsDB().get_config('max_recursion_page')
-        max_retry_attempts = SettingsDB().get_config('max_retry_attempts')
+        conn = None
 
         try:
-            with conn.cursor() as cur:
-                with lock_claim_next:
-                    rows = []
+            with lock_claim_next:
+                if _claim_next_ids:
+                    return _claim_next_ids.pop(0)
 
-                    def build_in_clause(ids: list[int]) -> str:
-                        return ', '.join(['%s'] * len(ids))
+                settings_db = SettingsDB()
+                domain_cooldown_ms = int(settings_db.get_config('domain_request_interval_ms'))
+                retry_interval_ms = int(settings_db.get_config('retry_interval_ms'))
 
-                    # -------- First attempt: TODO using cached ids --------
-                    if _claim_next_ids:
-                        in_clause = build_in_clause(_claim_next_ids)
-                        cur.execute(
-                            f"""
-                            SELECT
-                                p.id,
-                                p.url,
-                                d.id AS domain_id
-                            FROM pages p
-                            INNER JOIN domain d
-                                ON d.id = p.domain_id
-                            WHERE
-                                p.id IN ({in_clause})
-                                AND p.recursion_level < %s
-                                AND d.recursion_level < %s
-                                AND p.retry_count < %s
-                                AND (
-                                    d.last_request_at IS NULL
-                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                )
-                                AND p.status = %s
-                            LIMIT 20
-                            """,
-                            [
-                                *_claim_next_ids,
-                                max_recursion_page,
-                                max_recursion,
-                                max_retry_attempts,
-                                domain_cooldown_seconds,
-                                PageStatus.TODO.value,
-                            ],
+                domain_cooldown_us = domain_cooldown_ms * 1000
+                retry_interval_us = retry_interval_ms * 1000
+
+                max_recursion = settings_db.get_config('max_recursion')
+                max_recursion_page = settings_db.get_config('max_recursion_page')
+                max_retry_attempts = settings_db.get_config('max_retry_attempts')
+
+                conn = get_connection()
+
+                def select_batch(cur, status: PageStatus) -> list[dict]:
+                    retry_clause = ''
+                    prior_retry_clause = ''
+                    params = [
+                        max_recursion_page,
+                        max_recursion,
+                        max_retry_attempts,
+                        domain_cooldown_us,
+                        status.value,
+                    ]
+
+                    if status == PageStatus.FAILED:
+                        retry_clause = (
+                            'AND p.updated_at <= CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND'
                         )
-                        rows = cur.fetchall()
-
-                    # -------- Fallback: TODO without cached ids --------
-                    if not rows:
-                        cur.execute(
-                            """
-                            SELECT
-                                p.id,
-                                p.url,
-                                d.id AS domain_id
-                            FROM pages p
-                            INNER JOIN domain d
-                                ON d.id = p.domain_id
-                            WHERE
-                                p.recursion_level < %s
-                                AND d.recursion_level < %s
-                                AND p.retry_count < %s
-                                AND (
-                                    d.last_request_at IS NULL
-                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                )
-                                AND p.status = %s
-                            LIMIT 20
-                            """,
-                            [
-                                max_recursion_page,
-                                max_recursion,
-                                max_retry_attempts,
-                                domain_cooldown_seconds,
-                                PageStatus.TODO.value,
-                            ],
+                        prior_retry_clause = (
+                            'AND prior.updated_at <= '
+                            'CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND'
                         )
-                        rows = cur.fetchall()
+                        params.append(retry_interval_us)
 
-                    # -------- If no TODO found, try FAILED using cached ids --------
-                    if not rows and _claim_next_ids:
-                        in_clause = build_in_clause(_claim_next_ids)
-                        cur.execute(
-                            f"""
-                            SELECT
-                                p.id,
-                                p.url,
-                                d.id AS domain_id
-                            FROM pages p
-                            INNER JOIN domain d
-                                ON d.id = p.domain_id
-                            WHERE
-                                p.id IN ({in_clause})
-                                AND p.recursion_level < %s
-                                AND d.recursion_level < %s
-                                AND p.retry_count < %s
-                                AND (
-                                    d.last_request_at IS NULL
-                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                                )
-                                AND p.status = %s
-                                AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                            LIMIT 20
-                            """,
-                            [
-                                *_claim_next_ids,
-                                max_recursion_page,
-                                max_recursion,
-                                max_retry_attempts,
-                                domain_cooldown_seconds,
-                                PageStatus.FAILED.value,
-                                retry_interval_seconds,
-                            ],
-                        )
-                        rows = cur.fetchall()
+                    params.extend(
+                        [
+                            max_recursion_page,
+                            max_retry_attempts,
+                            status.value,
+                        ]
+                    )
 
-                    # -------- Fallback: FAILED without cached ids --------
-                    if not rows:
-                        cur.execute(
-                            """
-                            SELECT
-                                p.id,
-                                p.url,
-                                d.id AS domain_id
-                            FROM pages p
-                            INNER JOIN domain d
-                                ON d.id = p.domain_id
-                            WHERE
-                                p.recursion_level < %s
-                                AND d.recursion_level < %s
-                                AND p.retry_count < %s
-                                AND (
-                                    d.last_request_at IS NULL
-                                    OR d.last_request_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
+                    if status == PageStatus.FAILED:
+                        params.append(retry_interval_us)
+
+                    params.append(CLAIM_BATCH_SIZE)
+
+                    cur.execute(
+                        f"""
+                        SELECT
+                            p.id,
+                            d.id AS domain_id
+                        FROM pages p
+                        INNER JOIN domain d
+                            ON d.id = p.domain_id
+                        WHERE
+                            p.recursion_level < %s
+                            AND d.recursion_level < %s
+                            AND p.retry_count < %s
+                            AND (
+                                d.last_request_at IS NULL
+                                OR d.last_request_at <= (
+                                    CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND
                                 )
-                                AND p.status = %s
-                                AND p.updated_at <= CURRENT_TIMESTAMP - INTERVAL %s SECOND
-                            LIMIT 20
-                            """,
-                            [
-                                max_recursion_page,
-                                max_recursion,
-                                max_retry_attempts,
-                                domain_cooldown_seconds,
-                                PageStatus.FAILED.value,
-                                retry_interval_seconds,
-                            ],
-                        )
-                        rows = cur.fetchall()
+                            )
+                            AND p.status = %s
+                            {retry_clause}
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM pages prior
+                                WHERE prior.domain_id = p.domain_id
+                                  AND prior.recursion_level < %s
+                                  AND prior.retry_count < %s
+                                  AND prior.status = %s
+                                  {prior_retry_clause}
+                                  AND prior.id < p.id
+                            )
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        params,
+                    )
+                    return cur.fetchall()
+
+                with conn.cursor() as cur:
+                    rows = select_batch(cur, PageStatus.TODO)
 
                     if not rows:
-                        _claim_next_ids = []
+                        rows = select_batch(cur, PageStatus.FAILED)
+
+                    if not rows:
                         conn.rollback()
                         return None
 
-                    # always refresh cached ids with currently available rows
-                    _claim_next_ids = [row['id'] for row in rows]
+                    claimed_ids = [int(row['id']) for row in rows]
+                    domain_ids = sorted({int(row['domain_id']) for row in rows})
 
-                    row = random.choice(rows)
-
-                    # remove claimed id from cache
-                    _claim_next_ids = [
-                        page_id for page_id in _claim_next_ids if page_id != row['id']
-                    ]
-
+                    pages_in_clause = ', '.join(['%s'] * len(claimed_ids))
                     cur.execute(
-                        """
+                        f"""
                         UPDATE pages
                         SET status = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s
+                        WHERE id IN ({pages_in_clause})
                         """,
-                        (PageStatus.PROCESSING.value, row['id']),
+                        [PageStatus.PROCESSING.value, *claimed_ids],
                     )
 
+                    if cur.rowcount != len(claimed_ids):
+                        raise RuntimeError(
+                            f'Claim batch update mismatch: expected={len(claimed_ids)} '
+                            f'affected={cur.rowcount}'
+                        )
+
+                    domains_in_clause = ', '.join(['%s'] * len(domain_ids))
                     cur.execute(
-                        """
+                        f"""
                         UPDATE domain
-                        SET updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s
+                        SET updated_at = CURRENT_TIMESTAMP(6)
+                        WHERE id IN ({domains_in_clause})
                         """,
-                        (row['domain_id'],),
+                        domain_ids,
                     )
 
                 conn.commit()
-                return row['id']
-
+                _claim_next_ids = claimed_ids
+                return _claim_next_ids.pop(0)
         except Exception:
-            conn.rollback()
+            if conn is not None:
+                conn.rollback()
+            _claim_next_ids = []
             raise
 
     @classmethod
@@ -464,6 +457,7 @@ class Page:
         html_md5: bytes | None = None,
         exclude_id: int | None = None,
     ) -> int | None:
+        """Find another page with the same text or HTML digest."""
         if not text_md5 and not html_md5:
             return None
 
@@ -496,6 +490,7 @@ class Page:
             row = cur.fetchone()
             return int(row['id']) if row else None
 
+    # pylint: disable-next=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
     def update(
         self,
         status: PageStatus | str | None = None,
@@ -510,6 +505,7 @@ class Page:
         text: str | None = None,
         html: str | None = None,
     ) -> int:
+        """Update this page in the database and keep local fields in sync."""
         sets: list[str] = []
         params: list[object] = []
 
@@ -560,23 +556,24 @@ class Page:
             self.status_code = status_code
 
         if title is not None:
+            title = title[: min(settings.MAX_CHARACTERS_TEXT, _TITLE_MAX_CHARACTERS)]
             sets.append('title = %s')
             params.append(title)
             self.title = title
 
         if text is not None:
-            text = text[: settings.MAX_CHARACTERS_TEXT]
-            new_text_md5 = self.url_to_md5(text)
+            text, compressed_text = _prepare_content_for_storage(text)
+            new_text_md5 = md5_bin16(text)
             sets.append('text = %s')
-            params.append(_compress_str(text))
+            params.append(compressed_text)
             sets.append('text_md5 = %s')
             params.append(new_text_md5)
 
         if html is not None and settings.SAVE_HTML:
-            html = html[: settings.MAX_CHARACTERS_TEXT]
-            new_html_md5 = self.url_to_md5(html)
+            html, compressed_html = _prepare_content_for_storage(html)
+            new_html_md5 = md5_bin16(html)
             sets.append('html = %s')
-            params.append(_compress_str(html))
+            params.append(compressed_html)
             sets.append('html_md5 = %s')
             params.append(new_html_md5)
 
@@ -601,7 +598,7 @@ class Page:
             conn.commit()
 
             if text is not None:
-                self.text = text[: settings.MAX_CHARACTERS_TEXT]
+                self.text = text
                 self.text_md5 = new_text_md5
 
             if html is not None and settings.SAVE_HTML:
@@ -650,11 +647,14 @@ class Page:
             raise
 
     @classmethod
-    def release_stucked_processing(cls, older_than_seconds: int = 60) -> int:
+    def release_stucked_processing(cls, older_than_seconds: int | None = None) -> int:
         """
         Move pages com status PROCESSING e updated_at mais antigo que X segundos de volta para TODO.
         Retorna a quantidade de registros afetados.
         """
+        if older_than_seconds is None:
+            older_than_seconds = settings.PROCESSING_TIMEOUT_SECONDS
+
         conn = get_connection()
         try:
             with conn.cursor() as cur:
@@ -681,7 +681,9 @@ class Page:
             raise
 
     @classmethod
+    # pylint: disable-next=too-many-locals
     def bulk_insert_ignore(cls, rows: list[dict]) -> int:
+        """Bulk insert pages while ignoring duplicates."""
         if not rows:
             return 0
 
@@ -689,7 +691,7 @@ class Page:
         batch_size = 1000
         total_affected = 0
 
-        seen: set[tuple[int, str]] = set()
+        seen: set[bytes] = set()
         prepared_rows: list[tuple] = []
 
         for row in rows:
@@ -740,7 +742,16 @@ class Page:
                 for item in batch:
                     params.extend(item)
 
-                cur.execute(sql, params)
+                retry_counter = 0
+
+                while True:
+                    try:
+                        cur.execute(sql, params)
+                        break
+                    except pymysql.MySQLError as e:
+                        retry_counter += 1
+                        if retry_counter >= 3:
+                            raise e
                 total_affected += cur.rowcount
 
         conn.commit()

@@ -1,3 +1,37 @@
+x-obscura-common: &obscura-common
+  image: h4ckf0r0day/obscura:latest
+  command: ["serve", "--port", "9222", "--host", "0.0.0.0", "--stealth"]
+  restart: unless-stopped
+
+x-worker-common: &worker-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 35s
+
+x-worker-env: &worker-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: appdb
+  DB_USER: appuser
+  DB_PASSWORD: apppass
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318
+  MAX_THREADS: 1
+  PROCESSING_TIMEOUT_SECONDS: 900
+  GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: 30
+  BROWSER_BACKEND: obscura
+  OBSCURA_CDP_CONNECT_TIMEOUT_SECONDS: 60
+  DATABASE_URL: mysql+pymysql://appuser:apppass@mysql:3306/appdb
+  OTEL_SERVICE_NAME: miner
+  OTEL_SERVICE_VERSION: 1.0.0
+  OTEL_ENV: dev
+  MINER_TELEMETRY_ENABLED: false
+  SAVE_HTML: False
+  MAX_CHARACTERS_TEXT: 1000000
+
 services:
   mysql:
     image: mysql:8.0.45
@@ -10,9 +44,9 @@ services:
     ports:
       - "3306:3306"
     volumes:
-      - ./mysql_data:/var/lib/mysql
+      - ./container_data/mysql_data:/var/lib/mysql
       - ./mysql_init:/docker-entrypoint-initdb.d:ro
-      - ./mysql_logs:/var/log/mysql
+      - ./container_data/mysql_logs:/var/log/mysql
     command:
       - --slow_query_log=1
       - --slow_query_log_file=/var/log/mysql/slow.log
@@ -40,93 +74,224 @@ services:
       - "8080:80"
     restart: unless-stopped
 
-  jaeger:
-    image: jaegertracing/all-in-one:1.76.0
-    container_name: jaeger
+  # jaeger:
+  #   image: jaegertracing/all-in-one:1.76.0
+  #   container_name: jaeger
+  #   environment:
+  #     SPAN_STORAGE_TYPE: badger
+  #     BADGER_EPHEMERAL: "false"
+  #     BADGER_DIRECTORY_VALUE: /badger/data
+  #     BADGER_DIRECTORY_KEY: /badger/key
+  #   ports:
+  #     - "16686:16686"
+  #     - "14269:14269"
+  #   volumes:
+  #     - ./container_data/jaeger_data/data:/badger/data
+  #     - ./container_data/jaeger_data/key:/badger/key
+  #   restart: unless-stopped
+
+  # otel-collector:
+  #   image: otel/opentelemetry-collector-contrib:0.147.0
+  #   container_name: otel-collector
+  #   command: ["--config=/etc/otelcol/config.yaml"]
+  #   volumes:
+  #     - ./otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+  #     - ./container_data/otel_data:/var/lib/otelcol
+  #   ports:
+  #     - "4317:4317"
+  #     - "4318:4318"
+  #     - "9464:9464"
+  #   depends_on:
+  #     - jaeger
+  #     - loki
+  #   restart: unless-stopped
+
+  # loki:
+  #   image: grafana/loki:3.6.0
+  #   container_name: loki
+  #   command: -config.file=/etc/loki/config.yaml
+  #   ports:
+  #     - "3100:3100"
+  #   volumes:
+  #     - ./loki/config.yaml:/etc/loki/config.yaml:ro
+  #     - ./container_data/loki/data:/loki
+  #   restart: unless-stopped
+
+  # grafana:
+  #   image: grafana/grafana:12.1.1
+  #   container_name: grafana
+  #   ports:
+  #     - "3000:3000"
+  #   volumes:
+  #     - ./container_data/grafana_data:/var/lib/grafana
+  #   depends_on:
+  #     - loki
+  #   restart: unless-stopped
+
+  # prometheus:
+  #   image: prom/prometheus:v3.10.0
+  #   container_name: prometheus
+  #   command:
+  #     - --config.file=/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - ./container_data/prometheus_data:/prometheus
+  #   restart: unless-stopped
+
+  obscura-1:
+    <<: *obscura-common
+    ports:
+      - "9222:9222"
+
+  obscura-2:
+    <<: *obscura-common
+
+  obscura-3:
+    <<: *obscura-common
+
+  obscura-4:
+    <<: *obscura-common
+
+  obscura-5:
+    <<: *obscura-common
+
+  obscura-6:
+    <<: *obscura-common
+
+  obscura-7:
+    <<: *obscura-common
+
+  obscura-8:
+    <<: *obscura-common
+
+  obscura-9:
+    <<: *obscura-common
+
+  obscura-10:
+    <<: *obscura-common
+
+  obscura-11:
+    <<: *obscura-common
+
+  worker-1:
+    <<: *worker-common
     environment:
-      SPAN_STORAGE_TYPE: badger
-      BADGER_EPHEMERAL: "false"
-      BADGER_DIRECTORY_VALUE: /badger/data
-      BADGER_DIRECTORY_KEY: /badger/key
-    ports:
-      - "16686:16686"
-      - "14269:14269"
-    volumes:
-      - ./jaeger_data/data:/badger/data
-      - ./jaeger_data/key:/badger/key
-    restart: unless-stopped
-
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.147.0
-    container_name: otel-collector
-    command: ["--config=/etc/otelcol/config.yaml"]
-    volumes:
-      - ./otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
-      - ./otel_data:/var/lib/otelcol
-    ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "9464:9464"
-    depends_on:
-      - jaeger
-      - loki
-    restart: unless-stopped
-
-  loki:
-    image: grafana/loki:3.6.0
-    container_name: loki
-    command: -config.file=/etc/loki/config.yaml
-    ports:
-      - "3100:3100"
-    volumes:
-      - ./loki/config.yaml:/etc/loki/config.yaml:ro
-      - ./loki/data:/loki
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:12.1.1
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./grafana_data:/var/lib/grafana
-    depends_on:
-      - loki
-    restart: unless-stopped
-
-  prometheus:
-    image: prom/prometheus:v3.10.0
-    container_name: prometheus
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus_data:/prometheus
-    restart: unless-stopped
-
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      DB_HOST: mysql
-      DB_PORT: "3306"
-      DB_NAME: appdb
-      DB_USER: appuser
-      DB_PASSWORD: apppass
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318
-      MAX_THREADS: 2
-      DATABASE_URL: mysql+pymysql://appuser:apppass@mysql:3306/appdb
-      OTEL_SERVICE_NAME: miner
-      OTEL_SERVICE_VERSION: 1.0.0
-      OTEL_ENV: dev
-      SAVE_HTML: False
-      MAX_CHARACTERS_TEXT: 1000000
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-1:9222
     depends_on:
       mysql:
         condition: service_healthy
-    restart: unless-stopped
+      obscura-1:
+        condition: service_started
+
+  worker-2:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-2:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-2:
+        condition: service_started
+
+  worker-3:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-3:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-3:
+        condition: service_started
+
+  worker-4:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-4:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-4:
+        condition: service_started
+
+  worker-5:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-5:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-5:
+        condition: service_started
+
+  worker-6:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-6:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-6:
+        condition: service_started
+
+  worker-7:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-7:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-7:
+        condition: service_started
+
+  worker-8:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-8:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-8:
+        condition: service_started
+
+  worker-9:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-9:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-9:
+        condition: service_started
+
+  worker-10:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-10:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-10:
+        condition: service_started
+
+  worker-11:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      OBSCURA_CDP_ENDPOINT: http://obscura-11:9222
+    depends_on:
+      mysql:
+        condition: service_healthy
+      obscura-11:
+        condition: service_started
