@@ -96,6 +96,9 @@ CREATE TABLE `pages` (
   KEY `idx_pages_failed_pick`
     (`status`, `recursion_level`, `retry_count`, `updated_at`, `domain_id`, `id`),
 
+  KEY `idx_pages_prior_domain_pick`
+    (`domain_id`, `status`, `id`, `recursion_level`, `retry_count`),
+
   CONSTRAINT `fk_pages_domain`
     FOREIGN KEY (`domain_id`) REFERENCES `domain` (`id`)
     ON DELETE CASCADE
