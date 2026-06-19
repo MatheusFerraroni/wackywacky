@@ -228,3 +228,4 @@ jaeger_data/
 grafana_data/
 loki/data/
 mysql_logs/
+commands.txt
