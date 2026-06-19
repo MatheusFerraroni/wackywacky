@@ -38,6 +38,16 @@ from miner.settings.settings_db import SettingsDB
 
 tracer = trace.get_tracer(__name__)
 
+_SUPPORTED_PREFLIGHT_CONTENT_TYPES = (
+    'text/',
+    'application/json',
+    'application/ld+json',
+    'application/xml',
+    'application/xhtml+xml',
+    'application/rss+xml',
+    'application/atom+xml',
+)
+
 
 class _HTMLTextExtractor(HTMLParser):
     """Extract visible-ish text from HTML without adding a runtime dependency."""
@@ -268,6 +278,69 @@ class Requester:  # pylint: disable=too-many-instance-attributes
         except PlaywrightError as e:
             span.set_attribute('playwright.body.http_fallback_error', str(e)[:500])
             return None, None, None
+
+    @staticmethod
+    def _is_supported_preflight_content_type(content_type: str | None) -> bool:
+        normalized = (content_type or '').split(';', maxsplit=1)[0].strip().lower()
+        return not normalized or normalized.startswith(_SUPPORTED_PREFLIGHT_CONTENT_TYPES)
+
+    def _run_preflight_http(
+        self, page_playwright, span
+    ) -> tuple[bool, int | None, str | None]:
+        if not settings.PREFLIGHT_ENABLED:
+            span.set_attribute('preflight.enabled', False)
+            return True, None, None
+
+        span.set_attribute('preflight.enabled', True)
+        started_at = time.perf_counter()
+        timeout_ms = settings.PREFLIGHT_TIMEOUT_MS
+        try:
+            with self._monitored_step('preflight_request_get', timeout_ms=timeout_ms):
+                response = page_playwright.context.request.get(self.url, timeout=timeout_ms)
+
+            duration_s = time.perf_counter() - started_at
+            status_code = response.status
+            content_type = response.headers.get('content-type', '')
+            final_url = getattr(response, 'url', self.url)
+
+            if status_code >= 400:
+                outcome = 'blocked_status_code'
+                reason = f'wrong http status code {status_code}'
+            elif not self._is_supported_preflight_content_type(content_type):
+                outcome = 'blocked_content_type'
+                reason = f'unsupported content type {content_type}'
+            else:
+                outcome = 'continue'
+                reason = None
+
+            span.set_attribute('preflight.status_code', status_code)
+            span.set_attribute('preflight.content_type', content_type)
+            span.set_attribute('preflight.duration_s', duration_s)
+            span.set_attribute('preflight.final_url', final_url)
+            span.set_attribute('preflight.outcome', outcome)
+            log_message = 'Preflight allowed browser navigation'
+            if reason is not None:
+                log_message = 'Preflight blocked browser navigation'
+            self._log_info(
+                log_message,
+                preflight_outcome=outcome,
+                preflight_status_code=status_code,
+                preflight_content_type=content_type,
+                preflight_duration_s=round(duration_s, 3),
+            )
+            return reason is None, status_code, reason
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            duration_s = time.perf_counter() - started_at
+            span.set_attribute('preflight.outcome', 'unavailable')
+            span.set_attribute('preflight.duration_s', duration_s)
+            span.set_attribute('preflight.error', str(exc)[:500])
+            self._log_info(
+                'Preflight unavailable; continuing to browser navigation',
+                preflight_outcome='unavailable',
+                preflight_error=str(exc)[:500],
+                preflight_duration_s=round(duration_s, 3),
+            )
+            return True, None, None
 
     def _read_page_title(self, page_playwright, span):
         """Read page title without failing the request on Obscura CDP quirks."""
@@ -545,7 +618,12 @@ class Requester:  # pylint: disable=too-many-instance-attributes
         """Navigate, extract content, persist the page, and enqueue discovered links."""
         self.start_timer('request.begin', count_towards_total=False)
         self.start_timer('before.goto', count_towards_total=True)
-        self._log_info('Mining started', request_timeout_ms=self.request_timeout_ms)
+        self._log_info(
+            'Mining started',
+            request_timeout_ms=self.request_timeout_ms,
+            preflight_enabled=settings.PREFLIGHT_ENABLED,
+            preflight_timeout_ms=settings.PREFLIGHT_TIMEOUT_MS,
+        )
 
         self.name = threading.current_thread().name
 
@@ -599,6 +677,25 @@ class Requester:  # pylint: disable=too-many-instance-attributes
             self.start_timer('goto.block', count_towards_total=True)
 
             try:
+                (
+                    should_continue_after_preflight,
+                    preflight_status_code,
+                    preflight_halt_reason,
+                ) = self._run_preflight_http(page_playwright, span)
+                if not should_continue_after_preflight:
+                    self.end_timer('goto.block')
+                    if (
+                        preflight_status_code is not None
+                        and preflight_status_code >= 400
+                    ):
+                        metric_requests_failed_status_code.add(1, {'service': 'miner'})
+                    self._halt(
+                        span,
+                        page_status=PageStatus.TODO,
+                        reason=preflight_halt_reason or 'preflight blocked',
+                    )
+                    return None
+
                 try:
                     metric_requests_made.add(1, {'service': 'miner'})
 

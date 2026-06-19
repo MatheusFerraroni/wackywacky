@@ -1,5 +1,7 @@
 """Page model and persistence helpers."""
 
+import logging
+import random
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,8 +16,11 @@ from miner.models.utils import md5_bin16, normalize_url
 from miner.settings.settings import settings
 from miner.settings.settings_db import SettingsDB
 
+logger = logging.getLogger(__name__)
+
 lock_claim_next = threading.RLock()
 CLAIM_BATCH_SIZE = 20
+CLAIM_OVERFETCH_SIZE = 1000
 
 _ZSTD_LEVEL = 11
 _MYSQL_MEDIUMBLOB_MAX_BYTES = 16_777_215
@@ -303,7 +308,7 @@ class Page:  # pylint: disable=too-many-instance-attributes
             raise
 
     @classmethod
-    # pylint: disable-next=too-many-locals
+    # pylint: disable-next=too-many-locals,too-many-statements
     def claim_next_todo_url(
         cls,
     ) -> int | None:
@@ -330,9 +335,12 @@ class Page:  # pylint: disable=too-many-instance-attributes
 
                 conn = get_connection()
 
-                def select_batch(cur, status: PageStatus) -> list[dict]:
+                def select_candidates(cur, status: PageStatus) -> list[dict]:
+                    index_name = {
+                        PageStatus.TODO: 'idx_pages_todo_pick',
+                        PageStatus.FAILED: 'idx_pages_failed_pick',
+                    }[status]
                     retry_clause = ''
-                    prior_retry_clause = ''
                     params = [
                         max_recursion_page,
                         max_recursion,
@@ -345,31 +353,16 @@ class Page:  # pylint: disable=too-many-instance-attributes
                         retry_clause = (
                             'AND p.updated_at <= CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND'
                         )
-                        prior_retry_clause = (
-                            'AND prior.updated_at <= '
-                            'CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND'
-                        )
                         params.append(retry_interval_us)
 
-                    params.extend(
-                        [
-                            max_recursion_page,
-                            max_retry_attempts,
-                            status.value,
-                        ]
-                    )
-
-                    if status == PageStatus.FAILED:
-                        params.append(retry_interval_us)
-
-                    params.append(CLAIM_BATCH_SIZE)
+                    params.append(CLAIM_OVERFETCH_SIZE)
 
                     cur.execute(
                         f"""
                         SELECT
                             p.id,
                             d.id AS domain_id
-                        FROM pages p
+                        FROM pages p FORCE INDEX ({index_name})
                         INNER JOIN domain d
                             ON d.id = p.domain_id
                         WHERE
@@ -384,51 +377,78 @@ class Page:  # pylint: disable=too-many-instance-attributes
                             )
                             AND p.status = %s
                             {retry_clause}
-                            AND NOT EXISTS (
-                                SELECT 1
-                                FROM pages prior
-                                WHERE prior.domain_id = p.domain_id
-                                  AND prior.recursion_level < %s
-                                  AND prior.retry_count < %s
-                                  AND prior.status = %s
-                                  {prior_retry_clause}
-                                  AND prior.id < p.id
-                            )
                         LIMIT %s
-                        FOR UPDATE SKIP LOCKED
                         """,
                         params,
                     )
                     return cur.fetchall()
 
+                def select_batch(cur, status: PageStatus) -> tuple[list[int], list[int], int]:
+                    candidates = select_candidates(cur, status)
+                    random.shuffle(candidates)
+                    seen_domain_ids = set()
+                    claimed_ids = []
+                    domain_ids = []
+
+                    def try_claim_candidate(candidate: dict) -> bool:
+                        update_retry_clause = ''
+                        update_params = [
+                            PageStatus.PROCESSING.value,
+                            int(candidate['id']),
+                            status.value,
+                            max_recursion_page,
+                            max_retry_attempts,
+                        ]
+
+                        if status == PageStatus.FAILED:
+                            update_retry_clause = (
+                                'AND updated_at <= '
+                                'CURRENT_TIMESTAMP(6) - INTERVAL %s MICROSECOND'
+                            )
+                            update_params.append(retry_interval_us)
+
+                        cur.execute(
+                            f"""
+                            UPDATE pages
+                            SET status = %s, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                              AND status = %s
+                              AND recursion_level < %s
+                              AND retry_count < %s
+                              {update_retry_clause}
+                            """,
+                            update_params,
+                        )
+                        return cur.rowcount == 1
+
+                    for row in candidates:
+                        domain_id = int(row['domain_id'])
+                        if domain_id in seen_domain_ids:
+                            continue
+
+                        if not try_claim_candidate(row):
+                            continue
+
+                        seen_domain_ids.add(domain_id)
+                        claimed_ids.append(int(row['id']))
+                        domain_ids.append(domain_id)
+
+                        if len(claimed_ids) >= CLAIM_BATCH_SIZE:
+                            break
+
+                    return claimed_ids, sorted(domain_ids), len(candidates)
+
                 with conn.cursor() as cur:
-                    rows = select_batch(cur, PageStatus.TODO)
+                    claim_status = PageStatus.TODO
+                    claimed_ids, domain_ids, candidates_count = select_batch(cur, claim_status)
 
-                    if not rows:
-                        rows = select_batch(cur, PageStatus.FAILED)
+                    if not claimed_ids:
+                        claim_status = PageStatus.FAILED
+                        claimed_ids, domain_ids, candidates_count = select_batch(cur, claim_status)
 
-                    if not rows:
+                    if not claimed_ids:
                         conn.rollback()
                         return None
-
-                    claimed_ids = [int(row['id']) for row in rows]
-                    domain_ids = sorted({int(row['domain_id']) for row in rows})
-
-                    pages_in_clause = ', '.join(['%s'] * len(claimed_ids))
-                    cur.execute(
-                        f"""
-                        UPDATE pages
-                        SET status = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE id IN ({pages_in_clause})
-                        """,
-                        [PageStatus.PROCESSING.value, *claimed_ids],
-                    )
-
-                    if cur.rowcount != len(claimed_ids):
-                        raise RuntimeError(
-                            f'Claim batch update mismatch: expected={len(claimed_ids)} '
-                            f'affected={cur.rowcount}'
-                        )
 
                     domains_in_clause = ', '.join(['%s'] * len(domain_ids))
                     cur.execute(
@@ -438,6 +458,16 @@ class Page:  # pylint: disable=too-many-instance-attributes
                         WHERE id IN ({domains_in_clause})
                         """,
                         domain_ids,
+                    )
+
+                    logger.info(
+                        'Claimed page batch | status=%s candidates_count=%s '
+                        'claimed_count=%s distinct_domains_count=%s overfetch_size=%s',
+                        claim_status.value,
+                        candidates_count,
+                        len(claimed_ids),
+                        len(domain_ids),
+                        CLAIM_OVERFETCH_SIZE,
                     )
 
                 conn.commit()

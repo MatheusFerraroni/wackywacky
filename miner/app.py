@@ -480,29 +480,59 @@ class App:  # pylint: disable=too-many-instance-attributes
 
     def _block_unneeded_resources(self, page):
         """Block resources that are not needed for text extraction."""
-        if settings.BROWSER_BACKEND == 'obscura':
-            self.logger.debug('Skipping request routing for Obscura backend')
-            return
+        seen_resource_types = set()
+        blocked_resource_types = set()
+        route_summary_logged = False
+
+        def log_route_summary():
+            nonlocal route_summary_logged
+            if route_summary_logged:
+                return
+            self.logger.info(
+                'Browser route resource types | seen=%s blocked=%s backend=%s',
+                sorted(seen_resource_types),
+                sorted(blocked_resource_types),
+                settings.BROWSER_BACKEND,
+            )
+            route_summary_logged = True
 
         def route_handler(route):
+            nonlocal route_summary_logged
             try:
                 if self.shutdown_event.is_set():
                     route.abort()
                     return
 
                 resource_type = route.request.resource_type
+                seen_resource_types.add(resource_type)
                 if resource_type in {'image', 'media', 'font'}:
+                    blocked_resource_types.add(resource_type)
                     route.abort()
                 else:
                     route.continue_()
-            except (asyncio.CancelledError, PlaywrightError):
-                pass
+
+                if not route_summary_logged and (
+                    len(seen_resource_types) >= 4 or blocked_resource_types
+                ):
+                    log_route_summary()
+            except (asyncio.CancelledError, PlaywrightError) as exc:
+                if not route_summary_logged:
+                    self.logger.warning(
+                        'Browser route handler failed. Continuing without blocking. error=%s',
+                        exc,
+                    )
+                    route_summary_logged = True
 
         try:
             page.route('**/*', route_handler)
-        except PlaywrightError:
+            summary_timer = threading.Timer(5.0, log_route_summary)
+            summary_timer.daemon = True
+            summary_timer.start()
+        except PlaywrightError as exc:
             self.logger.warning(
-                'Browser backend does not support request routing. Continuing without route block.'
+                'Browser backend does not support request routing. Continuing without route block. '
+                'error=%s',
+                exc,
             )
 
     def _mine(self):  # pylint: disable=too-many-branches,too-many-statements,broad-exception-caught

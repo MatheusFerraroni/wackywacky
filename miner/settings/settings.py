@@ -71,6 +71,8 @@ class Settings:  # pylint: disable=too-few-public-methods
 
     SAVE_HTML = os.getenv('SAVE_HTML', 'False').lower() == 'true'
     MAX_CHARACTERS_TEXT = int(os.getenv('MAX_CHARACTERS_TEXT', '1000000'))
+    PREFLIGHT_ENABLED = env_bool('PREFLIGHT_ENABLED', True)
+    PREFLIGHT_TIMEOUT_MS = int(os.getenv('PREFLIGHT_TIMEOUT_MS', '2000'))
 
     SECONDS_BETWEEN_UPDATE_SYSTEM_STATUS = 60
 
