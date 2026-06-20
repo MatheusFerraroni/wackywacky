@@ -39,6 +39,11 @@ metric_requests_failed_status_code = meter.create_counter(
     description='Total number of failed requests due to not returning or 400',
 )
 
+metric_page_hard_timeouts = meter.create_counter(
+    'page_hard_timeouts',
+    description='Total number of page subprocesses killed by hard timeout',
+)
+
 metric_request_domain_in_cooldown = meter.create_counter(
     'request_domain_in_cooldown',
     description='Total number of ignored page due to domain in cooldown',

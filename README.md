@@ -33,6 +33,7 @@ Leader (1)
 Workers (N)
 └── consomem páginas
 └── executam crawling com Playwright via Chromium ou Obscura/CDP
+└── isolam cada página em subprocesso com timeout duro
 
 ```
 
@@ -129,12 +130,21 @@ Principais:
 - `MAX_THREADS`
 - `PROCESSING_TIMEOUT_SECONDS`
 - `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS`
+- `MINER_PAGE_ISOLATION_ENABLED`
+- `MINER_PAGE_HARD_TIMEOUT_SECONDS`
 - `BROWSER_BACKEND`
 - `OBSCURA_CDP_ENDPOINT`
 - `OBSCURA_CDP_CONNECT_TIMEOUT_SECONDS`
 - `MINER_TELEMETRY_ENABLED`
 - `SAVE_HTML`
 - `MAX_CHARACTERS_TEXT`
+- `PREFLIGHT_ENABLED`
+- `PREFLIGHT_TIMEOUT_MS`
+- `BODY_READY_TIMEOUT_MS`
+- `TEXT_FALLBACK_TIMEOUT_MS`
+- `HREF_EXTRACTION_TIMEOUT_MS`
+- `PLAYWRIGHT_DEFAULT_TIMEOUT_MS`
+- `REQUESTER_TOTAL_TIMEOUT_SECONDS`
 
 ---
 
@@ -259,11 +269,13 @@ Essas migrações precisam ser aplicadas em bancos já existentes. O `mysql_init
 ## Concorrência
 
 - Threads limitadas por `MAX_THREADS`
-- Claim em batch de 20 com `FOR UPDATE SKIP LOCKED`
-- Cada batch reserva no máximo uma página por domínio
+- Claim em batch de 20 com overfetch e reserva atômica por `UPDATE ... WHERE status = ...`
+- Cada batch tenta reservar no máximo uma página por domínio
 - Lock distribuído (leader)
 - Cache de IDs para reduzir contenção
 - Lease de páginas `processing` controlado por `PROCESSING_TIMEOUT_SECONDS`
+- Por padrão, cada página roda em subprocesso próprio (`MINER_PAGE_ISOLATION_ENABLED=true`)
+- `MINER_PAGE_HARD_TIMEOUT_SECONDS` mata o subprocesso travado e devolve a página para `TODO`
 
 ---
 

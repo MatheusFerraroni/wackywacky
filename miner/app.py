@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import multiprocessing
 import random
 import secrets
 import signal
@@ -24,6 +25,7 @@ from miner.leader import LeaderElection
 from miner.metrics import (
     metric_any_request_duration,
     metric_clean_db_duration,
+    metric_page_hard_timeouts,
     metric_pages_released,
     metric_threads_alive,
 )
@@ -33,6 +35,58 @@ from miner.requester import Requester
 from miner.settings.settings import settings
 from miner.settings.settings_db import SettingsDB
 from miner.starter.starter import Starter
+
+
+def _run_page_request_subprocess(page_id: int) -> None:
+    """Process exactly one page in an isolated child process."""
+    # Import inside the child so spawned processes configure logging like the main entrypoint.
+    # pylint: disable=import-outside-toplevel
+    from miner.logging_config import configure_logging
+    from miner.telemetry import setup_telemetry
+
+    configure_logging(level=logging.INFO)
+    setup_telemetry()
+
+    logger = logging.getLogger('PageProcess')
+    child_shutdown_event = threading.Event()
+    child_app = App()
+    browser = None
+    context = None
+    page = None
+
+    try:
+        pager = Pager(page_id)
+        pager.load()
+        logger.info(
+            'Page subprocess loaded page | page_id=%s domain_id=%s url=%s',
+            pager.page.id,
+            pager.domain.id,
+            pager.page.url,
+        )
+
+        with sync_playwright() as pw:
+            browser = child_app._build_browser(pw)  # pylint: disable=protected-access
+            context = child_app._build_context(browser)  # pylint: disable=protected-access
+            page = context.new_page()
+            child_app._block_unneeded_resources(page)  # pylint: disable=protected-access
+
+            requester = Requester(shutdown_event=child_shutdown_event)
+            requester.prepare(pager)
+            requester.request(page)
+    finally:
+        if page is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                page.unroute('**/*')
+            with suppress(asyncio.CancelledError, Exception):
+                page.close()
+        if context is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                context.close()
+        if browser is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                browser.close()
+        close_connection()
+        logger.info('Page subprocess finished cleanup | page_id=%s', page_id)
 
 
 class App:  # pylint: disable=too-many-instance-attributes
@@ -49,6 +103,8 @@ class App:  # pylint: disable=too-many-instance-attributes
         self.threads_lock = threading.RLock()
         self.shutdown_event = threading.Event()
         self.lock_claim_url = threading.RLock()
+        self.child_processes = {}
+        self.child_processes_lock = threading.RLock()
         self.worker_id = 0
 
         self._last_threads_alive = 0
@@ -295,6 +351,9 @@ class App:  # pylint: disable=too-many-instance-attributes
         )
 
         while True:
+            if self.shutdown_event.is_set():
+                self._terminate_active_page_processes('graceful_shutdown')
+
             with self.threads_lock:
                 alive_threads = [thread for thread in self.threads if thread.is_alive()]
                 self.threads = alive_threads
@@ -378,12 +437,15 @@ class App:  # pylint: disable=too-many-instance-attributes
             'Chrome/122.0.0.0 Safari/537.36'
         )
 
-        return browser.new_context(
+        context = browser.new_context(
             user_agent=user_agent,
             java_script_enabled=True,
             ignore_https_errors=True,
             viewport={'width': 1366, 'height': 768},
         )
+        context.set_default_timeout(settings.PLAYWRIGHT_DEFAULT_TIMEOUT_MS)
+        context.set_default_navigation_timeout(settings.PLAYWRIGHT_DEFAULT_TIMEOUT_MS)
+        return context
 
     def _build_browser(self, pw):
         """Create or connect to the configured browser backend."""
@@ -535,11 +597,246 @@ class App:  # pylint: disable=too-many-instance-attributes
                 exc,
             )
 
-    def _mine(self):  # pylint: disable=too-many-branches,too-many-statements,broad-exception-caught
-        """Run the worker loop for one mining thread."""
-        thread_name = threading.current_thread().name
-        self.logger.info('Miner worker started | thread=%s', thread_name)
+    def _claim_next_pager(self, thread_name: str) -> Pager | None:
+        """Claim the next page and load its page/domain records."""
+        page_id = None
+        claim_wait = {
+            'started_at': time.perf_counter(),
+            'last_log_at': time.perf_counter(),
+        }
 
+        while not self.shutdown_event.is_set():
+            with self.lock_claim_url:
+                page_id = Page.claim_next_todo_url()
+
+            if page_id is not None:
+                break
+
+            now = time.perf_counter()
+            if now - claim_wait['last_log_at'] >= settings.SECONDS_BETWEEN_LOG_THREADS:
+                self.logger.info(
+                    'Waiting for claimable page | thread=%s wait_s=%.1f '
+                    'processing_timeout_s=%s',
+                    thread_name,
+                    now - claim_wait['started_at'],
+                    settings.PROCESSING_TIMEOUT_SECONDS,
+                )
+                claim_wait['last_log_at'] = now
+            time.sleep(random.random() * 0.5)
+
+        if self.shutdown_event.is_set():
+            return None
+
+        if page_id is None:
+            self.logger.warning('Nothing to mine')
+            return None
+
+        pager = Pager(page_id)
+        pager.load()
+        self.logger.info(
+            'Worker claimed page | thread=%s page_id=%s domain_id=%s '
+            'retry_count=%s url=%s',
+            thread_name,
+            pager.page.id,
+            pager.domain.id,
+            pager.page.retry_count,
+            pager.page.url,
+        )
+
+        if self.shutdown_event.is_set():
+            pager.page.update(status=PageStatus.TODO)
+            self.logger.info('Detected shutdown event')
+            return None
+
+        return pager
+
+    def _return_processing_page_to_todo(self, page_id: int, reason: str) -> None:
+        """Return a page to TODO only if it is still marked as processing."""
+        try:
+            page = Page.get_by_id(page_id)
+            if page is None:
+                self.logger.warning(
+                    'Could not return page to TODO because it no longer exists | '
+                    'page_id=%s reason=%s',
+                    page_id,
+                    reason,
+                )
+                return
+
+            if page.status != PageStatus.PROCESSING.value:
+                self.logger.info(
+                    'Skipping return to TODO because page already moved | '
+                    'page_id=%s status=%s reason=%s',
+                    page_id,
+                    page.status,
+                    reason,
+                )
+                return
+
+            page.update(status=PageStatus.TODO)
+            self.logger.warning(
+                'Returned processing page to TODO | page_id=%s reason=%s',
+                page_id,
+                reason,
+            )
+        # pylint: disable-next=broad-exception-caught
+        except Exception:
+            self.logger.exception(
+                'Failed to return processing page to TODO | page_id=%s reason=%s',
+                page_id,
+                reason,
+            )
+
+    @staticmethod
+    def _terminate_page_process(process, timeout_seconds: float = 5.0) -> None:
+        """Terminate a page process, then force kill it if it does not exit."""
+        if not process.is_alive():
+            return
+
+        process.terminate()
+        process.join(timeout=timeout_seconds)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=timeout_seconds)
+
+    def _terminate_active_page_processes(self, reason: str) -> None:
+        """Terminate all active page subprocesses during shutdown."""
+        with self.child_processes_lock:
+            active_processes = list(self.child_processes.items())
+
+        for page_id, process in active_processes:
+            if not process.is_alive():
+                continue
+            self.logger.warning(
+                'Terminating active page subprocess | page_id=%s pid=%s reason=%s',
+                page_id,
+                process.pid,
+                reason,
+            )
+            self._terminate_page_process(process)
+
+    def _run_request_in_subprocess(self, pager: Pager) -> None:
+        """Run one page request in a subprocess supervised by a hard timeout."""
+        started_at = time.perf_counter()
+        timeout_seconds = settings.MINER_PAGE_HARD_TIMEOUT_SECONDS
+        context = multiprocessing.get_context('spawn')
+        process = context.Process(
+            target=_run_page_request_subprocess,
+            args=(pager.page.id,),
+            name=f'{threading.current_thread().name}-page-{pager.page.id}',
+        )
+
+        process.start()
+        with self.child_processes_lock:
+            self.child_processes[pager.page.id] = process
+
+        self.logger.info(
+            'Page subprocess started | thread=%s page_id=%s domain_id=%s pid=%s '
+            'hard_timeout_s=%s',
+            threading.current_thread().name,
+            pager.page.id,
+            pager.domain.id,
+            process.pid,
+            timeout_seconds,
+        )
+
+        timed_out = False
+        stopped_for_shutdown = False
+        deadline = started_at + timeout_seconds
+
+        try:
+            while process.is_alive():
+                if self.shutdown_event.is_set():
+                    stopped_for_shutdown = True
+                    self.logger.warning(
+                        'Stopping page subprocess due to shutdown | page_id=%s pid=%s',
+                        pager.page.id,
+                        process.pid,
+                    )
+                    self._terminate_page_process(process)
+                    break
+
+                remaining_seconds = deadline - time.perf_counter()
+                if remaining_seconds <= 0:
+                    timed_out = True
+                    self.logger.error(
+                        'Page subprocess exceeded hard timeout | page_id=%s domain_id=%s '
+                        'pid=%s hard_timeout_s=%s',
+                        pager.page.id,
+                        pager.domain.id,
+                        process.pid,
+                        timeout_seconds,
+                    )
+                    metric_page_hard_timeouts.add(1, {'service': 'miner'})
+                    self._terminate_page_process(process)
+                    break
+
+                process.join(timeout=min(0.5, max(0.1, remaining_seconds)))
+
+            duration_s = time.perf_counter() - started_at
+            exitcode = process.exitcode
+
+            if timed_out:
+                self._return_processing_page_to_todo(pager.page.id, 'page_hard_timeout')
+            elif stopped_for_shutdown:
+                self._return_processing_page_to_todo(pager.page.id, 'shutdown')
+            elif exitcode != 0:
+                self.logger.error(
+                    'Page subprocess failed | page_id=%s domain_id=%s pid=%s '
+                    'exitcode=%s duration_s=%.3f',
+                    pager.page.id,
+                    pager.domain.id,
+                    process.pid,
+                    exitcode,
+                    duration_s,
+                )
+                self._return_processing_page_to_todo(pager.page.id, 'page_subprocess_failed')
+            else:
+                self.logger.info(
+                    'Page subprocess finished | page_id=%s domain_id=%s pid=%s '
+                    'exitcode=%s duration_s=%.3f',
+                    pager.page.id,
+                    pager.domain.id,
+                    process.pid,
+                    exitcode,
+                    duration_s,
+                )
+
+            metric_any_request_duration.record(
+                duration_s,
+                {'service': 'miner', 'leader': self.leader.is_leader},
+            )
+        finally:
+            with self.child_processes_lock:
+                self.child_processes.pop(pager.page.id, None)
+
+    def _run_request_inline(self, pager: Pager, page) -> None:
+        """Run one page request inside the current worker thread."""
+        requester = Requester(shutdown_event=self.shutdown_event)
+        requester.prepare(pager)
+
+        start_timer = time.perf_counter()
+        try:
+            requester.request(page)
+        # Keep this worker alive when one page/request fails unexpectedly.
+        # pylint: disable-next=broad-exception-caught
+        except Exception:
+            self.logger.exception('Unhandled exception inside requester')
+        metric_any_request_duration.record(
+            (time.perf_counter() - start_timer),
+            {'service': 'miner', 'leader': self.leader.is_leader},
+        )
+
+    def _mine_isolated(self, thread_name: str) -> None:
+        """Run the worker loop using one supervised child process per page."""
+        while not self.shutdown_event.is_set():
+            pager = self._claim_next_pager(thread_name)
+            if pager is None:
+                return
+            self._run_request_in_subprocess(pager)
+
+    def _mine_inline(self, thread_name: str) -> None:
+        """Run the legacy worker loop with a reusable browser page in this thread."""
         page = None
         context = None
         browser = None
@@ -549,102 +846,37 @@ class App:  # pylint: disable=too-many-instance-attributes
 
         try:
             with sync_playwright() as pw:
-                try:
-                    while not self.shutdown_event.is_set():
-                        if processed >= recreate_browser_every:
-                            processed = 0
-                            if page is not None:
-                                with suppress(asyncio.CancelledError, Exception):
-                                    page.unroute('**/*')
-                                with suppress(asyncio.CancelledError, Exception):
-                                    page.close()
-                                page = None
+                while not self.shutdown_event.is_set():
+                    if processed >= recreate_browser_every:
+                        processed = 0
+                        if page is not None:
+                            with suppress(asyncio.CancelledError, Exception):
+                                page.unroute('**/*')
+                            with suppress(asyncio.CancelledError, Exception):
+                                page.close()
+                            page = None
 
-                            if context is not None:
-                                with suppress(asyncio.CancelledError, Exception):
-                                    context.close()
-                                context = None
+                        if context is not None:
+                            with suppress(asyncio.CancelledError, Exception):
+                                context.close()
+                            context = None
 
-                            if browser is not None:
-                                with suppress(asyncio.CancelledError, Exception):
-                                    browser.close()
-                                browser = None
-                            browser = self._build_browser(pw)
-                            context = self._build_context(browser)
-                            page = context.new_page()
-                            self._block_unneeded_resources(page)
-                        url = None
-                        claim_wait = {
-                            'started_at': time.perf_counter(),
-                            'last_log_at': time.perf_counter(),
-                        }
+                        if browser is not None:
+                            with suppress(asyncio.CancelledError, Exception):
+                                browser.close()
+                            browser = None
 
-                        while not self.shutdown_event.is_set():
-                            with self.lock_claim_url:
-                                url = Page.claim_next_todo_url()
+                        browser = self._build_browser(pw)
+                        context = self._build_context(browser)
+                        page = context.new_page()
+                        self._block_unneeded_resources(page)
 
-                            if url is not None:
-                                break
+                    pager = self._claim_next_pager(thread_name)
+                    if pager is None:
+                        return
 
-                            now = time.perf_counter()
-                            if (
-                                now - claim_wait['last_log_at']
-                                >= settings.SECONDS_BETWEEN_LOG_THREADS
-                            ):
-                                self.logger.info(
-                                    'Waiting for claimable page | thread=%s wait_s=%.1f '
-                                    'processing_timeout_s=%s',
-                                    thread_name,
-                                    now - claim_wait['started_at'],
-                                    settings.PROCESSING_TIMEOUT_SECONDS,
-                                )
-                                claim_wait['last_log_at'] = now
-                            time.sleep(random.random() * 0.5)
-
-                        if self.shutdown_event.is_set():
-                            return
-
-                        if url is None:
-                            self.logger.warning('Nothing to mine')
-                            return
-
-                        pager = Pager(url)
-                        pager.load()
-                        self.logger.info(
-                            'Worker claimed page | thread=%s page_id=%s domain_id=%s '
-                            'retry_count=%s url=%s',
-                            thread_name,
-                            pager.page.id,
-                            pager.domain.id,
-                            pager.page.retry_count,
-                            pager.page.url,
-                        )
-
-                        if self.shutdown_event.is_set():
-                            pager.page.update(status=PageStatus.TODO)
-                            self.logger.info('Detected shutdown event')
-                            return
-
-                        requester = Requester(shutdown_event=self.shutdown_event)
-                        requester.prepare(pager)
-
-                        start_timer = time.perf_counter()
-                        try:
-                            processed += 1
-                            requester.request(page)
-                        # Keep this worker alive when one page/request fails unexpectedly.
-                        # pylint: disable-next=broad-exception-caught
-                        except Exception:
-                            self.logger.exception('Unhandled exception inside requester')
-                        metric_any_request_duration.record(
-                            (time.perf_counter() - start_timer),
-                            {'service': 'miner', 'leader': self.leader.is_leader},
-                        )
-
-                except Exception as e:
-                    self.logger.exception('Unhandled exception in miner thread')
-                    raise e
-
+                    processed += 1
+                    self._run_request_inline(pager, page)
         finally:
             if page is not None:
                 with suppress(asyncio.CancelledError, Exception):
@@ -657,6 +889,27 @@ class App:  # pylint: disable=too-many-instance-attributes
             if browser is not None:
                 with suppress(asyncio.CancelledError, Exception):
                     browser.close()
+
+    def _mine(self):  # pylint: disable=broad-exception-caught
+        """Run the worker loop for one mining thread."""
+        thread_name = threading.current_thread().name
+        self.logger.info(
+            'Miner worker started | thread=%s page_isolation_enabled=%s '
+            'page_hard_timeout_s=%s',
+            thread_name,
+            settings.MINER_PAGE_ISOLATION_ENABLED,
+            settings.MINER_PAGE_HARD_TIMEOUT_SECONDS,
+        )
+
+        try:
+            if settings.MINER_PAGE_ISOLATION_ENABLED:
+                self._mine_isolated(thread_name)
+            else:
+                self._mine_inline(thread_name)
+        except Exception as e:
+            self.logger.exception('Unhandled exception in miner thread')
+            raise e
+        finally:
             close_connection()
             self.logger.info('Quitting Worker')
 

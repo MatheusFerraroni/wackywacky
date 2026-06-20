@@ -1,4 +1,5 @@
 """Request execution and page extraction logic."""
+# pylint: disable=too-many-lines
 
 import logging
 import threading
@@ -151,34 +152,31 @@ class Requester:  # pylint: disable=too-many-instance-attributes
         return [href for href in hrefs if is_valid_url(href)]
 
     def _ensure_body_available(self, page_playwright, span):
-        """Wait for body, accepting CDP fallbacks when selector lookup is flaky."""
+        """Wait briefly for a DOM root, accepting CDP fallbacks when waits are flaky."""
+        timeout_ms = settings.BODY_READY_TIMEOUT_MS
         try:
-            body_timeout_ms = int(self.request_timeout_ms / 2)
-            with self._monitored_step('wait_for_selector_body', timeout_ms=body_timeout_ms):
-                page_playwright.wait_for_selector('body', timeout=body_timeout_ms)
+            with self._monitored_step('wait_for_body_or_document', timeout_ms=timeout_ms):
+                page_playwright.wait_for_function(
+                    '() => document.body || document.documentElement',
+                    timeout=timeout_ms,
+                )
+            span.set_attribute('playwright.body.ready_source', 'wait_for_function')
             return True
         except PlaywrightTimeout:
-            span.set_attribute('playwright.body.wait_for_selector.timeout', True)
+            span.set_attribute('playwright.body.wait_for_function.timeout', True)
+        except PlaywrightError as e:
+            span.set_attribute('playwright.body.wait_for_function.error', str(e)[:500])
 
         try:
             with self._monitored_step('evaluate_body_presence'):
-                has_body = page_playwright.evaluate('() => document.body !== null')
-            if has_body:
-                span.set_attribute('playwright.body.fallback', 'document.body')
+                has_root = page_playwright.evaluate(
+                    '() => Boolean(document.body || document.documentElement)'
+                )
+            if has_root:
+                span.set_attribute('playwright.body.fallback', 'evaluate_dom_root')
                 return True
         except PlaywrightError as e:
             span.set_attribute('playwright.body.fallback.evaluate_error', str(e)[:500])
-
-        try:
-            with self._monitored_step('evaluate_document_presence'):
-                has_document = page_playwright.evaluate(
-                    '() => document.documentElement !== null'
-                )
-            if has_document:
-                span.set_attribute('playwright.body.fallback', 'document.documentElement')
-                return True
-        except PlaywrightError as e:
-            span.set_attribute('playwright.document.fallback.evaluate_error', str(e)[:500])
 
         if settings.SAVE_HTML:
             try:
@@ -197,12 +195,6 @@ class Requester:  # pylint: disable=too-many-instance-attributes
     def _read_body_text(self, page_playwright, span):
         """Read body text with a JavaScript fallback for CDP compatibility."""
         try:
-            with self._monitored_step('read_body_inner_text', timeout_ms=2000):
-                return page_playwright.locator('body').inner_text(timeout=2000)
-        except (PlaywrightTimeout, PlaywrightError) as e:
-            span.set_attribute('playwright.body.inner_text_error', str(e)[:500])
-
-        try:
             with self._monitored_step('evaluate_body_text'):
                 text = page_playwright.evaluate(
                     '() => { const node = document.body || document.documentElement; '
@@ -212,6 +204,15 @@ class Requester:  # pylint: disable=too-many-instance-attributes
             return text if isinstance(text, str) else str(text or '')
         except PlaywrightError as e:
             span.set_attribute('playwright.body.evaluate_text_error', str(e)[:500])
+
+        try:
+            timeout_ms = settings.TEXT_FALLBACK_TIMEOUT_MS
+            with self._monitored_step('read_body_inner_text', timeout_ms=timeout_ms):
+                text = page_playwright.locator('body').inner_text(timeout=timeout_ms)
+            span.set_attribute('playwright.body.text_source', 'locator_inner_text')
+            return text
+        except (PlaywrightTimeout, PlaywrightError) as e:
+            span.set_attribute('playwright.body.inner_text_error', str(e)[:500])
             raise
 
     def _read_html_content(self, page_playwright, span):
@@ -222,26 +223,66 @@ class Requester:  # pylint: disable=too-many-instance-attributes
             return None
 
         try:
-            with self._monitored_step('read_page_content'):
-                html_content = page_playwright.content()
-            if isinstance(html_content, str):
-                return html_content
-            span.set_attribute('playwright.content.unexpected_type', type(html_content).__name__)
-        except PlaywrightError as e:
-            span.set_attribute('playwright.content.error', str(e)[:500])
-
-        try:
             with self._monitored_step('evaluate_page_content'):
                 html_content = page_playwright.evaluate(
                     '() => document.documentElement '
                     '? document.documentElement.outerHTML '
                     ": ''"
                 )
-            span.set_attribute('playwright.content.source', 'evaluate')
-            return html_content if isinstance(html_content, str) else str(html_content or '')
+            if isinstance(html_content, str):
+                span.set_attribute('playwright.content.source', 'evaluate')
+                return html_content
+            span.set_attribute('playwright.content.unexpected_type', type(html_content).__name__)
         except PlaywrightError as e:
-            span.set_attribute('playwright.content.fallback_error', str(e)[:500])
-            return ''
+            span.set_attribute('playwright.content.evaluate_error', str(e)[:500])
+
+        try:
+            with self._monitored_step('read_page_content'):
+                html_content = page_playwright.content()
+            if isinstance(html_content, str):
+                span.set_attribute('playwright.content.source', 'page_content')
+                return html_content
+            span.set_attribute('playwright.content.unexpected_type', type(html_content).__name__)
+        except PlaywrightError as e:
+            span.set_attribute('playwright.content.error', str(e)[:500])
+
+        return ''
+
+    def _read_dom_hrefs(self, page_playwright, span):
+        """Read hrefs directly through DOM evaluation, with locator fallback."""
+        try:
+            with self._monitored_step(
+                'evaluate_dom_hrefs',
+                timeout_ms=settings.HREF_EXTRACTION_TIMEOUT_MS,
+            ):
+                hrefs = page_playwright.evaluate(
+                    """
+                    () => Array.from(
+                        document.querySelectorAll('a[href]'),
+                        element => element.href
+                    )
+                    """
+                )
+            span.set_attribute('page.href_source', 'evaluate')
+            if not isinstance(hrefs, list):
+                span.set_attribute('page.href_unexpected_type', type(hrefs).__name__)
+                return []
+            return self.filter_valids_hrefs(hrefs)
+        except PlaywrightError as e:
+            span.set_attribute('page.href_evaluate_error', str(e)[:500])
+
+        try:
+            with self._monitored_step(
+                'extract_dom_hrefs',
+                timeout_ms=settings.HREF_EXTRACTION_TIMEOUT_MS,
+            ):
+                anchors = page_playwright.locator('a[href]')
+                hrefs = anchors.evaluate_all('elements => elements.map(e => e.href)')
+            span.set_attribute('page.href_source', 'locator_evaluate_all')
+            return self.filter_valids_hrefs(hrefs)
+        except PlaywrightError as e:
+            span.set_attribute('page.href_locator_error', str(e)[:500])
+            return []
 
     @staticmethod
     def _html_to_text(html_content):
@@ -345,21 +386,22 @@ class Requester:  # pylint: disable=too-many-instance-attributes
     def _read_page_title(self, page_playwright, span):
         """Read page title without failing the request on Obscura CDP quirks."""
         try:
-            with self._monitored_step('read_page_title'):
-                title = page_playwright.title()
+            with self._monitored_step('evaluate_page_title'):
+                title = page_playwright.evaluate("() => document.title || ''")
+            span.set_attribute('playwright.title.source', 'evaluate')
             if isinstance(title, str):
                 return title
             span.set_attribute('playwright.title.unexpected_type', type(title).__name__)
         except PlaywrightError as e:
-            span.set_attribute('playwright.title.error', str(e)[:500])
+            span.set_attribute('playwright.title.fallback_error', str(e)[:500])
 
         try:
-            with self._monitored_step('evaluate_page_title'):
-                title = page_playwright.evaluate("() => document.title || ''")
-            span.set_attribute('playwright.title.source', 'evaluate')
+            with self._monitored_step('read_page_title'):
+                title = page_playwright.title()
+            span.set_attribute('playwright.title.source', 'page_title')
             return title if isinstance(title, str) else str(title or '')
         except PlaywrightError as e:
-            span.set_attribute('playwright.title.fallback_error', str(e)[:500])
+            span.set_attribute('playwright.title.error', str(e)[:500])
             return ''
 
     def _log_context(self, **extra):
@@ -599,6 +641,24 @@ class Requester:  # pylint: disable=too-many-instance-attributes
 
         self.logger.debug('Timers: %s', ' | '.join(log_parts))
 
+    @staticmethod
+    def _request_total_timeout_exceeded(started_at: float) -> bool:
+        """Return whether the cooperative request timeout has elapsed."""
+        timeout_seconds = settings.REQUESTER_TOTAL_TIMEOUT_SECONDS
+        return time.perf_counter() - started_at >= timeout_seconds > 0
+
+    def _halt_if_request_total_timeout(self, span, started_at: float) -> bool:
+        """Stop between Playwright calls when the request already exceeded its budget."""
+        if not self._request_total_timeout_exceeded(started_at):
+            return False
+
+        self._halt(
+            span,
+            page_status=PageStatus.TODO,
+            reason='request_total_timeout',
+        )
+        return True
+
     def request(self, page_playwright):
         """Run the request and always emit timing information."""
         ret = None
@@ -616,6 +676,7 @@ class Requester:  # pylint: disable=too-many-instance-attributes
         self, page_playwright
     ):
         """Navigate, extract content, persist the page, and enqueue discovered links."""
+        request_started_at = time.perf_counter()
         self.start_timer('request.begin', count_towards_total=False)
         self.start_timer('before.goto', count_towards_total=True)
         self._log_info(
@@ -623,6 +684,8 @@ class Requester:  # pylint: disable=too-many-instance-attributes
             request_timeout_ms=self.request_timeout_ms,
             preflight_enabled=settings.PREFLIGHT_ENABLED,
             preflight_timeout_ms=settings.PREFLIGHT_TIMEOUT_MS,
+            requester_total_timeout_s=settings.REQUESTER_TOTAL_TIMEOUT_SECONDS,
+            body_ready_timeout_ms=settings.BODY_READY_TIMEOUT_MS,
         )
 
         self.name = threading.current_thread().name
@@ -696,6 +759,9 @@ class Requester:  # pylint: disable=too-many-instance-attributes
                     )
                     return None
 
+                if self._halt_if_request_total_timeout(span, request_started_at):
+                    return None
+
                 try:
                     metric_requests_made.add(1, {'service': 'miner'})
 
@@ -762,6 +828,9 @@ class Requester:  # pylint: disable=too-many-instance-attributes
                     metric_requests_failed.add(1, {'service': 'miner'})
                     return
 
+                if self._halt_if_request_total_timeout(span, request_started_at):
+                    return None
+
                 fallback_html_content = None
                 fallback_text_content = None
                 body_available = self._ensure_body_available(page_playwright, span)
@@ -798,6 +867,9 @@ class Requester:  # pylint: disable=too-many-instance-attributes
                 self.end_timer('goto.block')
                 self.start_timer('goto.processing', count_towards_total=True)
 
+                if self._halt_if_request_total_timeout(span, request_started_at):
+                    return None
+
                 if status_code is not None and status_code >= 400:
                     metric_requests_failed_status_code.add(1, {'service': 'miner'})
                     self._halt(
@@ -817,13 +889,13 @@ class Requester:  # pylint: disable=too-many-instance-attributes
                 title = self._read_page_title(page_playwright, span)
 
                 if fallback_html_content is None:
-                    with self._monitored_step('extract_dom_hrefs'):
-                        anchors = page_playwright.locator('a[href]')
-                        hrefs = anchors.evaluate_all('elements => elements.map(e => e.href)')
-                    hrefs = self.filter_valids_hrefs(hrefs)
+                    hrefs = self._read_dom_hrefs(page_playwright, span)
                 else:
                     hrefs = self._extract_hrefs_from_html(fallback_html_content, final_url)
                     span.set_attribute('page.href_source', 'http_fallback_html')
+
+                if self._halt_if_request_total_timeout(span, request_started_at):
+                    return None
 
                 metric_pages_saved.add(1, {'service': 'miner'})
 
