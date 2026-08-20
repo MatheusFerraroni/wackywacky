@@ -62,8 +62,8 @@ CREATE TABLE `pages` (
 
   `retry_count` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
 
-  `text` MEDIUMBLOB NULL,
-  `html` MEDIUMBLOB NULL,
+  `text` LONGBLOB NULL,
+  `html` LONGBLOB NULL,
   `text_md5` BINARY(16) NULL,
   `html_md5` BINARY(16) NULL,
 
